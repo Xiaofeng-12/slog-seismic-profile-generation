@@ -1127,10 +1127,10 @@ GRID_RANGES = {
     "window": lambda: [31],
     "p1": lambda: [1],
 
-    "log_sigma": lambda: [0.6,0.7,0.8,0.9, 1.0,1.1, 1.2],
-    "canny_sigma": lambda: [1.6,1.7,1.8,1.9],
-    "canny_low":   lambda: [0.1, 0.2],
-    "canny_high":  lambda: [0.4,0.5,0.6,0.7],
+    "log_sigma": lambda: [1.1],
+    "canny_sigma": lambda: [1.7],
+    "canny_low":   lambda: [0.1],
+    "canny_high":  lambda: [0.9],
 }
 
 def generate_grid_configs(params_to_grid: List[str], default_config: Dict[str, Any]) -> List[Dict[str, Any]]:
