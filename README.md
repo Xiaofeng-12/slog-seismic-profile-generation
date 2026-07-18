@@ -31,10 +31,15 @@ In the source code, the command-line value `glog` refers to the proposed SLoG im
 
 ```text
 slog-seismic-profile-generation/
+├── .gitignore
 ├── LICENSE
 ├── README.md
+├── requirements.txt
 ├── run_conditional_stylegan_experiment.py
-└── slog_parameter_search.py
+├── slog_parameter_search.py
+└── results/
+    ├── slog_test_runs.jsonl
+    └── slog_test_summary.json
 ```
 
 ### `run_conditional_stylegan_experiment.py`
@@ -70,17 +75,18 @@ matplotlib
 lpips
 ```
 
-Install the dependencies with:
+Create a Python 3.9 environment and install the dependencies with:
 
 ```bash
-pip install torch torchvision numpy scipy scikit-image opencv-python pillow tqdm pandas matplotlib lpips
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-For exact reproduction, use the package versions listed in the final `requirements.txt` or `environment.yml`.
+The provided `requirements.txt` installs PyTorch 1.12.1 with its official CUDA 11.6 runtime build. This runtime can operate with a newer NVIDIA driver that reports CUDA 12.6 support.
 
 ### Tested environment
 
-The code was developed and tested under Ubuntu 22.04 LTS using Python 3.9 and PyTorch 1.12. Experiments were conducted on a workstation equipped with an NVIDIA RTX A6000 GPU with 48 GB of VRAM and an Intel Xeon W5-3435X CPU. The installed NVIDIA driver environment reported support for CUDA 12.6.
+The code was developed and tested under Ubuntu 22.04 LTS using Python 3.9 and PyTorch 1.12. Experiments were conducted on a workstation equipped with an NVIDIA RTX A6000 GPU with 48 GB of VRAM and an Intel Xeon W5-3435X CPU. The NVIDIA driver and CUDA environment reported CUDA 12.6.
 
 ## Dataset
 
@@ -205,11 +211,25 @@ python run_conditional_stylegan_experiment.py \
 
 The current training code uses the first CUDA device visible to PyTorch when a GPU is available.
 
+## Pretrained checkpoints
+
+The pretrained checkpoints used for the paper are distributed through the repository's [GitHub Releases](https://github.com/Xiaofeng-12/slog-seismic-profile-generation/releases), rather than being stored directly in the Git repository.
+
+Download the following files and place them in a local `checkpoints/` directory:
+
+| Method | Release asset |
+|---|---|
+| SLoG | `slog_best_total_step17500.pth` |
+| LoG | `log_best_total_step23500.pth` |
+| Canny | `canny_best_total_step24500.pth` |
+
+These filenames identify both the edge prior and the selected training step. The original training files may be renamed to the filenames above when they are uploaded as release assets.
+
 ## Testing the selected checkpoints
 
 When a checkpoint contains both `G_ema` and `G`, the program uses `G_ema` for testing.
 
-The paper uses five base seeds (`43–47`) and three repeats per base seed. In the current implementation, the three effective seeds for a base seed `s` are `s`, `s + 100000`, and `s + 200000`.
+The reported test results use five base seeds (`43–47`) and three repeats per base seed, giving 15 runs for each method. In the current implementation, the three effective seeds for a base seed `s` are `s`, `s + 100000`, and `s + 200000`. Each run evaluates 256 samples drawn from the 800-image test set.
 
 The selected checkpoints are:
 
@@ -228,7 +248,7 @@ python run_conditional_stylegan_experiment.py \
   --mode test \
   --data_dir ./data/test \
   --out_dir ./outputs/test_slog \
-  --ckpt_path ./checkpoints/checkpoint_17500.pth \
+  --ckpt_path ./checkpoints/slog_best_total_step17500.pth \
   --device cuda:0 \
   --edge_type glog \
   --tex_layout fault,agc,edge \
@@ -252,7 +272,7 @@ python run_conditional_stylegan_experiment.py \
   --mode test \
   --data_dir ./data/test \
   --out_dir ./outputs/test_log \
-  --ckpt_path ./checkpoints/checkpoint_23500.pth \
+  --ckpt_path ./checkpoints/log_best_total_step23500.pth \
   --device cuda:0 \
   --edge_type log \
   --tex_layout fault,agc,edge \
@@ -276,7 +296,7 @@ python run_conditional_stylegan_experiment.py \
   --mode test \
   --data_dir ./data/test \
   --out_dir ./outputs/test_canny \
-  --ckpt_path ./checkpoints/checkpoint_24500.pth \
+  --ckpt_path ./checkpoints/canny_best_total_step24500.pth \
   --device cuda:0 \
   --edge_type canny \
   --tex_layout fault,agc,edge \
@@ -372,6 +392,8 @@ The implementation calculates:
 
 During periodic training evaluation, 256 conditions are fixed to improve comparability across checkpoints. KID is calculated from 20 repeated subset estimates. The reported PRDC results use `k = 3`, with 200 repeated resampling calculations and 95% confidence intervals.
 
+The reported KID values are KID-style unbiased polynomial-kernel MMD² estimates computed in the domain-specific GEO and Phi feature spaces, rather than in an Inception feature space.
+
 FD in this repository is computed from domain-specific Phi features and should not be interpreted as ImageNet FID.
 
 ## Output files
@@ -404,11 +426,10 @@ single_pairs/
 
 GAN training is stochastic, and exact numerical results may vary across GPU models, CUDA runtimes, drivers, and PyTorch versions.
 
-For the final paper-associated release, the repository should additionally provide:
+For the final paper-associated release, the repository should provide:
 
-- a version-pinned `requirements.txt` or `environment.yml`;
 - the final training and test image lists;
-- the exact checkpoint files used for the reported test results;
+- the three selected checkpoint files through GitHub Releases;
 - the raw metric output files used to construct the paper tables.
 
 ## Citation

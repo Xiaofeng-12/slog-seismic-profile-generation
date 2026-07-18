@@ -1,0 +1,23 @@
+# Recommended reproducibility environment
+# Operating system: Ubuntu 22.04 LTS
+# Python: 3.9
+#
+# PyTorch 1.12.1 does not provide an official CUDA 12.6 wheel.
+# The cu116 wheel below is the latest official CUDA wheel for PyTorch 1.12.1.
+# It can be used with a sufficiently recent NVIDIA driver that reports
+# CUDA 12.6 support.
+
+--extra-index-url https://download.pytorch.org/whl/cu116
+
+torch==1.12.1+cu116
+torchvision==0.13.1+cu116
+
+numpy==1.23.5
+scipy==1.9.3
+scikit-image==0.19.3
+opencv-python==4.7.0.72
+Pillow==9.5.0
+tqdm==4.65.0
+pandas==1.5.3
+matplotlib==3.7.1
+lpips==0.1.4
