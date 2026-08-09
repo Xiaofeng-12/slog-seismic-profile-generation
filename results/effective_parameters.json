@@ -1,0 +1,40 @@
+{
+  "sgs_params": {
+    "sigma": 1.5,
+    "anisotropy": 2.2,
+    "iterations": 1,
+    "base_kappa": 10.0,
+    "gamma": 0.06,
+    "option": 1,
+    "lambda_perp_base": 0.001,
+    "lambda_par_base": 1.0,
+    "coherence_influence": 1.0,
+    "device": "cuda:3",
+    "prefer_fp16": false,
+    "nl_h": 0.8
+  },
+  "agc_params": {
+    "window": 31,
+    "eps": 1e-08,
+    "p1": 1.0
+  },
+  "det_params": {
+    "tex_layout": "fault,agc,edge",
+    "glog_sigma": 0.4,
+    "glog_anisotropy": 2.1,
+    "glog_nangles": 8,
+    "glog_sharpness": 14.0,
+    "glog_alpha": 0.92,
+    "glog_aniso_clip": 4.0,
+    "glog_gamma_scale": 1.0,
+    "glog_dist_mode": "relative",
+    "glog_coherence_influence": 1.0,
+    "glog_size_factor": 6.0,
+    "glog_use_absolute_sigma": false,
+    "edge_thr": 0.35,
+    "log_sigma": 1.1,
+    "canny_sigma": 1.7,
+    "canny_low": 0.1,
+    "canny_high": 0.9
+  }
+}
