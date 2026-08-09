@@ -1,3 +1,18 @@
+"""
+Main implementation for conditional seismic-profile synthesis.
+
+Modes
+-----
+train:
+    Train the conditional StyleGAN2 model.
+test:
+    Evaluate a trained checkpoint using the shared domain evaluator.
+generate:
+    Generate source-associated synthetic data for downstream segmentation.
+diversity:
+    Evaluate latent-code sensitivity under fixed conditions and fixed
+    synthesis noise.
+"""
 import os, math, random, argparse, time,json,statistics
 from pathlib import Path
 from PIL import Image
@@ -20,7 +35,15 @@ from scipy.stats import wasserstein_distance
 from scipy.linalg import sqrtm
 from scipy.stats import ks_2samp
 import copy
-
+import csv
+import shutil
+try:
+    import lpips
+    _have_lpips = True
+except ImportError:
+    lpips = None
+    _have_lpips = False
+    
 def _dump_pt(x, name, step, dump_dir="nan_dumps"):
     os.makedirs(dump_dir, exist_ok=True)
     path = os.path.join(dump_dir, f"{step}_{name}_{int(time.time())}.pt")
@@ -138,7 +161,18 @@ def call_with_channel_arg(func, *args, channel_axis=None, multichannel=False, **
 
 def estimate_sigma_compat(img: np.ndarray) -> float:
     if _have_skimage:
-        return float(call_with_channel_arg(restoration.estimate_sigma, img, channel_axis=None, multichannel=False))
+        try:
+            return float(call_with_channel_arg(
+                restoration.estimate_sigma,
+                img,
+                channel_axis=None,
+                multichannel=False,
+            ))
+        except Exception as exc:
+            logging.warning(
+                "skimage estimate_sigma failed (%s); using robust MAD fallback",
+                exc,
+            )
     try:
         return float(np.median(np.abs(img - np.median(img))) * 1.4826)
     except Exception:
@@ -684,7 +718,7 @@ def compute_edge_map_from_preprocessed(
 
      et = edge_type.strip().lower()
 
-     if et == "glog":
+     if et in ("glog", "slog"):
          merged_det_b = dict(det_params)
          merged_det_b.update({
              "glog_sigma":       float(det_params.get("glog_sigma", 0.8)),
@@ -903,6 +937,33 @@ def compute_texture_maps_single(
     tex = np.stack(tex_list, axis=0).astype(np.float32)  # (C_tex,H,W)
     return tex
 
+def fit_valid_standardizer(
+    features: np.ndarray,
+    eps: float = 1e-6,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    features = np.asarray(features, dtype=np.float64)
+
+    mean = features.mean(axis=0, keepdims=True)
+    std_raw = features.std(axis=0, keepdims=True)
+
+    valid = (
+        np.isfinite(std_raw[0])
+        & (std_raw[0] > float(eps))
+    )
+
+    if not np.any(valid):
+        raise ValueError(
+            "No valid non-constant feature dimensions remain."
+        )
+
+    std_safe = np.where(
+        valid.reshape(1, -1),
+        std_raw,
+        1.0,
+    )
+
+    return mean, std_safe, valid
+
 def compute_texture_maps_batch(
     imgs: torch.Tensor,
     sgs_params: Dict[str, Any],
@@ -980,6 +1041,190 @@ class ImageFolderDataset(Dataset):
         t = T.ToTensor()(crop)  # (1,H,W)
         t = T.Normalize([0.5], [0.5])(t)  # 1ch
         return t
+
+class PairedGenerationDataset(Dataset):
+    """
+    专门用于按文件名一一对应生成下游实验数据。
+
+    要求：
+    1. 图像已经裁剪为 img_size × img_size；
+    2. 文件名为纯数字，例如 0.png、37.png；
+    3. 图像与标签使用相同数字文件名。
+    """
+
+    IMAGE_EXTENSIONS = {
+        ".png", ".jpg", ".jpeg", ".bmp",
+        ".tif", ".tiff", ".webp",
+    }
+
+    def __init__(
+        self,
+        image_dir,
+        label_dir,
+        img_size=512,
+        expected_num=350,
+    ):
+        self.image_dir = Path(image_dir)
+        self.label_dir = Path(label_dir)
+        self.img_size = int(img_size)
+
+        if not self.image_dir.is_dir():
+            raise FileNotFoundError(
+                f"Image directory does not exist: {self.image_dir}"
+            )
+
+        if not self.label_dir.is_dir():
+            raise FileNotFoundError(
+                f"Label directory does not exist: {self.label_dir}"
+            )
+
+        image_paths = [
+            p for p in self.image_dir.iterdir()
+            if p.is_file()
+            and p.suffix.lower() in self.IMAGE_EXTENSIONS
+        ]
+
+        label_paths = [
+            p for p in self.label_dir.iterdir()
+            if p.is_file()
+            and p.suffix.lower() in self.IMAGE_EXTENSIONS
+        ]
+
+        # 要求纯数字命名
+        invalid_images = [
+            p.name for p in image_paths
+            if not p.stem.isdigit()
+        ]
+        invalid_labels = [
+            p.name for p in label_paths
+            if not p.stem.isdigit()
+        ]
+
+        if invalid_images:
+            raise ValueError(
+                f"Image filenames must be numeric: {invalid_images[:10]}"
+            )
+
+        if invalid_labels:
+            raise ValueError(
+                f"Label filenames must be numeric: {invalid_labels[:10]}"
+            )
+
+        # 按数字自然排序
+        image_map = {
+            int(p.stem): p
+            for p in image_paths
+        }
+        label_map = {
+            int(p.stem): p
+            for p in label_paths
+        }
+
+        image_ids = set(image_map)
+        label_ids = set(label_map)
+
+        missing_labels = sorted(image_ids - label_ids)
+        missing_images = sorted(label_ids - image_ids)
+
+        if missing_labels:
+            raise RuntimeError(
+                f"Images without labels: {missing_labels[:20]}"
+            )
+
+        if missing_images:
+            raise RuntimeError(
+                f"Labels without images: {missing_images[:20]}"
+            )
+
+        common_ids = sorted(image_ids & label_ids)
+
+        if expected_num > 0 and len(common_ids) != expected_num:
+            raise ValueError(
+                f"Expected {expected_num} image-label pairs, "
+                f"but found {len(common_ids)}."
+            )
+
+        self.records = [
+            {
+                "id": image_id,
+                "image_path": image_map[image_id],
+                "label_path": label_map[image_id],
+            }
+            for image_id in common_ids
+        ]
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, index):
+        record = self.records[index]
+
+        image_path = record["image_path"]
+        label_path = record["label_path"]
+
+        image = Image.open(image_path).convert("L")
+        label = Image.open(label_path).convert("L")
+
+        if image.size != (self.img_size, self.img_size):
+            raise ValueError(
+                f"{image_path.name}: expected "
+                f"{self.img_size}×{self.img_size}, "
+                f"but got {image.size}."
+            )
+
+        if label.size != (self.img_size, self.img_size):
+            raise ValueError(
+                f"{label_path.name}: expected "
+                f"{self.img_size}×{self.img_size}, "
+                f"but got {label.size}."
+            )
+
+        image_tensor = T.ToTensor()(image)
+        image_tensor = T.Normalize(
+            [0.5],
+            [0.5],
+        )(image_tensor)
+
+        return {
+            "image": image_tensor,
+            "image_id": int(record["id"]),
+            "image_path": str(image_path),
+            "label_path": str(label_path),
+        }
+
+def make_latent_batch(
+    image_ids,
+    z_dim,
+    base_seed,
+    device,
+):
+    """
+    为每个原始图像编号生成固定潜变量。
+
+    同一个 image_id 在SLoG、LoG、Canny实验中会得到相同z。
+    """
+    latent_list = []
+    latent_seeds = []
+
+    for image_id in image_ids:
+        image_id = int(image_id)
+        latent_seed = int(base_seed) + image_id
+
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(latent_seed)
+
+        z = torch.randn(
+            int(z_dim),
+            generator=generator,
+            dtype=torch.float32,
+        )
+
+        latent_list.append(z)
+        latent_seeds.append(latent_seed)
+
+    z_batch = torch.stack(latent_list, dim=0).to(device)
+
+    return z_batch, latent_seeds
 
 class EqualizedLinear(nn.Module):
     def __init__(self, in_dim, out_dim, lr_mul=1.0, bias=True):
@@ -1924,10 +2169,51 @@ def geo_subscores(real_feat: np.ndarray, fake_feat: np.ndarray,
     return scores
 
 PHI_LAYOUT = {
-    "StructTex": slice(0, 32),        # struct_tex (16)
-    "Spectrum":  slice(32, 96),  # spec64
-    "Energy":    slice(96, 160),  # hist
+    "StructTex": slice(0, 32),   # 32 structural/texture scalars
+    "Spectrum":  slice(32, 96),  # 64 spectral bins
+    "Energy":    slice(96, 160), # 64 amplitude-histogram bins
 }
+PHI_DIM = max(sl.stop for sl in PHI_LAYOUT.values())
+
+
+def standardize_features_by_real(
+    real_feat: np.ndarray,
+    fake_feat: np.ndarray,
+    eps: float = 1e-8,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Z-score features using statistics fitted only on the real reference set.
+
+    Dimensions whose real-set standard deviation is <= ``eps`` are marked
+    invalid and set to zero in both standardized arrays.  This avoids
+    dividing by a near-zero scale while preserving the original column layout
+    needed by ``PHI_LAYOUT``.  Callers may remove invalid columns for metrics
+    that operate only on the full embedding (for example KID and PRDC).
+    """
+    R = np.asarray(real_feat, dtype=np.float64)
+    F_ = np.asarray(fake_feat, dtype=np.float64)
+
+    if R.ndim != 2 or F_.ndim != 2:
+        raise ValueError(f"Expected 2-D feature arrays, got {R.shape} and {F_.shape}")
+    if R.shape[1] != F_.shape[1]:
+        raise ValueError(f"Feature dimensions differ: real={R.shape[1]}, fake={F_.shape[1]}")
+    if R.shape[0] < 2 or F_.shape[0] < 2:
+        raise ValueError("At least two real and two fake samples are required")
+    if not np.isfinite(R).all() or not np.isfinite(F_).all():
+        raise ValueError("Feature arrays contain NaN or Inf values")
+
+    mu = R.mean(axis=0, keepdims=True)
+    sd = R.std(axis=0, keepdims=True)
+    valid = np.isfinite(sd[0]) & (sd[0] > float(eps))
+    if not np.any(valid):
+        raise ValueError("No non-constant real-reference feature dimensions remain")
+
+    scale = np.where(valid[None, :], sd + float(eps), 1.0)
+    Rn = (R - mu) / scale
+    Fn = (F_ - mu) / scale
+    Rn[:, ~valid] = 0.0
+    Fn[:, ~valid] = 0.0
+
+    return Rn, Fn, mu, sd, valid
 
 def phi_features_single(gray01: np.ndarray,
                         sgs_params: Dict[str,Any],
@@ -2005,6 +2291,11 @@ def phi_features_single(gray01: np.ndarray,
     hist = hist / (hist.sum() + 1e-12)
 
     phi = np.concatenate([struct_tex, spec64, hist], axis=0).astype(np.float32)
+    if phi.shape[0] != PHI_DIM:
+        raise ValueError(
+            f"Unexpected phi dimension {phi.shape[0]}; expected {PHI_DIM}. "
+            f"Keep n_spec=64 and n_hist=64 when using the fixed PHI_LAYOUT."
+        )
     return phi
 
 def phi_features_batch(real_imgs: torch.Tensor,
@@ -2040,20 +2331,42 @@ def frechet_distance(mu1, cov1, mu2, cov2, eps=1e-6) -> float:
 
     return float(diff.dot(diff) + np.trace(cov1 + cov2 - 2.0 * covmean))
 
-def frechet_phi_scores(phi_real: np.ndarray, phi_fake: np.ndarray) -> Dict[str, float]:
-    scores = {}
-    # total
-    mu_r = phi_real.mean(axis=0)
-    mu_f = phi_fake.mean(axis=0)
-    cov_r = np.cov(phi_real, rowvar=False)
-    cov_f = np.cov(phi_fake, rowvar=False)
-    scores["Total"] = frechet_distance(mu_r, cov_r, mu_f, cov_f)
+def frechet_phi_scores(
+    phi_real: np.ndarray,
+    phi_fake: np.ndarray,
+    valid_mask: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """Compute total and grouped FD from a common phi coordinate system.
 
-    # groups
-    for k, sl in PHI_LAYOUT.items():
-        R = phi_real[:, sl]
-        F = phi_fake[:, sl]
-        scores[k] = frechet_distance(R.mean(0), np.cov(R, rowvar=False), F.mean(0), np.cov(F, rowvar=False))
+    The caller is responsible for standardization.  ``valid_mask`` is applied
+    consistently to the total embedding and to each PHI_LAYOUT group.
+    """
+    R_all = np.asarray(phi_real, dtype=np.float64)
+    F_all = np.asarray(phi_fake, dtype=np.float64)
+    if R_all.ndim != 2 or F_all.ndim != 2 or R_all.shape[1] != F_all.shape[1]:
+        raise ValueError(f"Invalid phi shapes: real={R_all.shape}, fake={F_all.shape}")
+    if R_all.shape[1] != PHI_DIM:
+        raise ValueError(f"Expected {PHI_DIM}-D phi features, got {R_all.shape[1]}")
+
+    if valid_mask is None:
+        valid = np.ones(R_all.shape[1], dtype=bool)
+    else:
+        valid = np.asarray(valid_mask, dtype=bool).reshape(-1)
+        if valid.size != R_all.shape[1]:
+            raise ValueError(f"valid_mask has {valid.size} entries; expected {R_all.shape[1]}")
+
+    def _fd(R: np.ndarray, F_: np.ndarray) -> float:
+        if R.shape[1] == 0:
+            return float("nan")
+        return frechet_distance(
+            R.mean(axis=0), np.cov(R, rowvar=False),
+            F_.mean(axis=0), np.cov(F_, rowvar=False),
+        )
+
+    scores = {"Total": _fd(R_all[:, valid], F_all[:, valid])}
+    for name, sl in PHI_LAYOUT.items():
+        group_valid = valid[sl]
+        scores[name] = _fd(R_all[:, sl][:, group_valid], F_all[:, sl][:, group_valid])
     return scores
 
 def rr_frechet_thresholds(
@@ -2062,11 +2375,23 @@ def rr_frechet_thresholds(
     percentile: float = 95.0,
     min_per_split: int = 64,
     seed: int = 0,
+    valid_mask: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
 
     rng = np.random.RandomState(int(seed) & 0x7fffffff)
     phi_real = np.asarray(phi_real, dtype=np.float64)
+    if phi_real.ndim != 2 or phi_real.shape[1] != PHI_DIM:
+        raise ValueError(f"Expected phi_real with shape (N,{PHI_DIM}), got {phi_real.shape}")
     N = phi_real.shape[0]
+
+    if valid_mask is None:
+        valid = np.ones(phi_real.shape[1], dtype=bool)
+    else:
+        valid = np.asarray(valid_mask, dtype=bool).reshape(-1)
+        if valid.size != phi_real.shape[1]:
+            raise ValueError(f"valid_mask has {valid.size} entries; expected {phi_real.shape[1]}")
+    if not np.any(valid):
+        return {}
 
     if N < 2 * int(min_per_split):
         return {}
@@ -2096,16 +2421,19 @@ def rr_frechet_thresholds(
         A = phi_real[idx[:nA]]
         B = phi_real[idx[nA:nA + nB]]
 
-        rr["Total"].append(_fd(A, B))
+        rr["Total"].append(_fd(A[:, valid], B[:, valid]))
         for name, sl in PHI_LAYOUT.items():
-            rr[name].append(_fd(A[:, sl], B[:, sl]))
+            group_valid = valid[sl]
+            if np.any(group_valid):
+                rr[name].append(_fd(A[:, sl][:, group_valid], B[:, sl][:, group_valid]))
 
     if len(rr["Total"]) < max(3, int(trials) // 3):
         return {}
 
     q = float(percentile)
     for k, vals in rr.items():
-        thr[k] = float(np.percentile(np.asarray(vals, dtype=np.float64), q))
+        if vals:
+            thr[k] = float(np.percentile(np.asarray(vals, dtype=np.float64), q))
 
     return thr
 
@@ -2870,8 +3198,14 @@ def train(args):
     sign_stat_ema = 0.0
     
     edge_type = getattr(args, "edge_type", "glog").strip().lower()
-    if edge_type not in ("glog","log", "canny"):
-        raise ValueError(f"edge_type must be one of ['glog','log','canny'], got '{edge_type}'")
+    if edge_type not in ("slog", "glog", "log", "canny"):
+        raise ValueError(f"edge_type must be one of ['slog','glog','log','canny'], got '{edge_type}'")
+    evaluation_edge_type = str(getattr(args, "eval_edge_type", "log")).strip().lower()
+    if evaluation_edge_type not in ("slog", "glog", "log", "canny"):
+        raise ValueError(
+            f"eval_edge_type must be one of ['slog','glog','log','canny'], "
+            f"got '{evaluation_edge_type}'"
+        )
     device = torch.device('cuda' if torch.cuda.is_available() and args.gpus>0 else 'cpu')
     print('Device:', device)
     amp = (args.amp and device.type == 'cuda')
@@ -2882,7 +3216,8 @@ def train(args):
 
     logger.info(
         f"Device={device} | AMP={amp} | img_size={args.img_size} | "
-        f"batch={args.batch} | epochs={args.epochs} | edge_type={edge_type} | tex_layout={args.tex_layout}"
+        f"batch={args.batch} | epochs={args.epochs} | condition_edge={edge_type} | "
+        f"evaluation_edge={evaluation_edge_type} | tex_layout={args.tex_layout}"
     )
     ctrl = AdaptiveStructureController(
         mul_grad=1.0, mul_dir=1.0, mul_ori=1.0,
@@ -3505,7 +3840,7 @@ def train(args):
                             sgs_params=sgs_params,
                             agc_params=agc_params,
                             det_params=det_params,
-                            edge_type=edge_type
+                            edge_type=evaluation_edge_type
                         )
                         
                         all_real.append(real_feat)
@@ -3516,7 +3851,7 @@ def train(args):
                             sgs_params=sgs_params,
                             agc_params=agc_params,
                             det_params=det_params,
-                            edge_type=edge_type
+                            edge_type=evaluation_edge_type
                         )
                         
                         all_phi_real.append(phi_r)
@@ -3594,7 +3929,7 @@ def train(args):
                     print(f"[eval-geo-kid] step {step} | KID(MMD2) {geo_kid_mean:.6f} ± {geo_kid_std:.6f}")
                     # ===== RR-KID in GEO feature space =====
                     rr_geo_kid = rr_kid_thresholds(
-                        geo_real, 
+                        geo_real_n,
                         trials=int(getattr(args, "rr_kid_trials", 20)),
                         percentile=float(getattr(args, "rr_kid_percentile", 95.0)),
                         subset_size=int(getattr(args, "kid_subset_size", 100)),
@@ -3620,8 +3955,8 @@ def train(args):
                         )
 
                     
-                    gammas = estimate_group_gammas(real_feat_all, fake_feat_all, seed=args.seed + step)
-                    mean_scores = geo_subscores(real_feat_all, fake_feat_all, mmd_gamma=gammas)
+                    gammas = estimate_group_gammas(geo_real_n, geo_fake_n, seed=args.seed + step)
+                    mean_scores = geo_subscores(geo_real_n, geo_fake_n, mmd_gamma=gammas)
 
                     # --- PRDC by GEO groups (Structure/Texture/Spectrum/Energy) ---
                     for gname, sl in GEO_FEAT_LAYOUT.items():
@@ -3672,15 +4007,26 @@ def train(args):
                     phi_real_all = np.concatenate(all_phi_real, axis=0)
                     phi_fake_all = np.concatenate(all_phi_fake, axis=0)
 
-                    # Fréchet(φ): total + groups
-                    fd_scores = frechet_phi_scores(phi_real_all, phi_fake_all)
+                    # Fit z-score statistics only on the real reference set, then
+                    # use the same standardized coordinates for FD, RR-FD, KID and PRDC.
+                    phi_real_n_full, phi_fake_n_full, _, _, phi_valid = standardize_features_by_real(
+                        phi_real_all, phi_fake_all, eps=1e-8
+                    )
+                    phi_real_n = phi_real_n_full[:, phi_valid]
+                    phi_fake_n = phi_fake_n_full[:, phi_valid]
+
+                    # Fréchet(phi): total + groups on standardized features.
+                    fd_scores = frechet_phi_scores(
+                        phi_real_n_full, phi_fake_n_full, valid_mask=phi_valid
+                    )
                     # ===== RR-FD (Real-Real self-consistency) thresholds =====
                     rr_fd = rr_frechet_thresholds(
-                        phi_real_all,
+                        phi_real_n_full,
                         trials=int(getattr(args, "rr_fd_trials", 20)),
                         percentile=float(getattr(args, "rr_fd_percentile", 95.0)),
                         min_per_split=int(getattr(args, "rr_fd_min_n", 64)),
                         seed=int(args.seed + step),
+                        valid_mask=phi_valid,
                     )
 
                     if rr_fd:
@@ -3749,21 +4095,13 @@ def train(args):
                     # W1/KS by groups
                     dist_scores = group_w1_ks(phi_real_all, phi_fake_all)
 
-                    # --- PRDC in φ space (recommended: standardize by real stats) ---
-                    phi_r = phi_real_all.astype(np.float64)
-                    phi_f = phi_fake_all.astype(np.float64)
-
-                    mu_phi = phi_r.mean(axis=0, keepdims=True)
-                    sd_phi = phi_r.std(axis=0, keepdims=True) + 1e-8
-                    phi_r_n = (phi_r - mu_phi) / sd_phi
-                    phi_f_n = (phi_f - mu_phi) / sd_phi
-
+                    # --- PRDC/KID in the same standardized phi embedding ---
                     k_list_phi = list(prdc_ks)
                     n_boot = int(prdc_boot)
                     ci_pct = float(prdc_ci)
 
                     phi_prdc_curve = prdc_curve_with_ci(
-                        phi_r_n, phi_f_n,
+                        phi_real_n, phi_fake_n,
                         k_list=k_list_phi,
                         n_boot=n_boot,
                         ci=ci_pct,
@@ -3776,7 +4114,7 @@ def train(args):
 
                     # --- KID (poly-kernel unbiased MMD^2) on φ embedding ---
                     phi_kid_mean, phi_kid_std = kid_poly_mmd2(
-                        phi_r_n, phi_f_n,
+                        phi_real_n, phi_fake_n,
                         subset_size=kid_subset_size,
                         n_subsets=kid_subsets,
                         degree=kid_degree,
@@ -3851,7 +4189,8 @@ def train(args):
                         "geo_w":   {k: mean_scores[k]["w"]   for k in mean_scores},
                         "geo_kid_mean": float(geo_kid_mean),
                         "geo_kid_std":  float(geo_kid_std),
-                        "phi_fd": fd_scores,                # dict
+                        "phi_fd": fd_scores,                # standardized phi FD
+                        "phi_valid_dimensions": int(np.sum(phi_valid)),
                         "phi_kid_mean": float(phi_kid_mean),
                         "phi_kid_std":  float(phi_kid_std),
                     }
@@ -3985,6 +4324,20 @@ def _load_generator_from_ckpt(args, device, cond_channels, in_ch: int):
         print("[warn] missing keys in G:", missing[:20], ("..." if len(missing) > 20 else ""))
     if len(unexpected) > 0:
         print("[warn] unexpected keys in G:", unexpected[:20], ("..." if len(unexpected) > 20 else ""))
+    strict_generate = bool(
+        getattr(args, "strict_generate_ckpt", False)
+    )
+
+    if strict_generate and (
+        len(missing) > 0
+        or len(unexpected) > 0
+    ):
+        raise RuntimeError(
+            "Checkpoint does not exactly match the current "
+            "generator architecture.\n"
+            f"Missing keys: {missing[:20]}\n"
+            f"Unexpected keys: {unexpected[:20]}"
+        )
     apply_g_bounds_(G, args)
     G.eval()
     return G
@@ -3997,7 +4350,8 @@ def evaluate_once(
     sgs_params,
     agc_params,
     det_params,
-    edge_type: str,
+    condition_edge_type: str,
+    evaluation_edge_type: str,
     seed: int,
 ):
 
@@ -4012,11 +4366,44 @@ def evaluate_once(
 
     set_seed_all(base_seed)
 
-    fixed_cond_imgs = []
-    for _ in range(eval_cond_num):
-        idx = int(rng.randint(0, len(ds)))
-        fixed_cond_imgs.append(ds[idx].unsqueeze(0))  # (1,1,H,W)
-    fixed_cond_imgs = torch.cat(fixed_cond_imgs, dim=0).to(device, non_blocking=True)
+    eval_pool_path = str(getattr(args, "eval_pool_path", "")).strip()
+
+    if eval_pool_path and os.path.isfile(eval_pool_path):
+        pool_obj = torch.load(eval_pool_path, map_location="cpu")
+        if isinstance(pool_obj, dict):
+            fixed_cond_imgs = pool_obj["real_crops"]
+        else:
+            fixed_cond_imgs = pool_obj
+
+        if fixed_cond_imgs.shape[0] != eval_cond_num:
+            raise ValueError(
+                f"Saved evaluation pool contains {fixed_cond_imgs.shape[0]} crops, "
+                f"but eval_cond_num={eval_cond_num}."
+            )
+    else:
+        fixed_cond_imgs = []
+        selected_indices = []
+
+        for _ in range(eval_cond_num):
+            idx = int(rng.randint(0, len(ds)))
+            selected_indices.append(idx)
+            fixed_cond_imgs.append(ds[idx].unsqueeze(0))
+
+        fixed_cond_imgs = torch.cat(fixed_cond_imgs, dim=0)
+
+        if eval_pool_path:
+            os.makedirs(os.path.dirname(eval_pool_path) or ".", exist_ok=True)
+            torch.save(
+                {
+                    "real_crops": fixed_cond_imgs.cpu(),
+                    "dataset_indices": selected_indices,
+                    "base_seed": base_seed,
+                    "eval_cond_num": eval_cond_num,
+                },
+                eval_pool_path,
+            )
+
+    fixed_cond_imgs = fixed_cond_imgs.to(device, non_blocking=True)
 
     with torch.no_grad():
         fixed_cond_tex = compute_texture_maps_batch(
@@ -4025,7 +4412,7 @@ def evaluate_once(
             agc_params=agc_params,
             det_params=det_params,
             device=device,
-            edge_type=edge_type,
+            edge_type=condition_edge_type,
         )
 
     set_seed_all(seed)
@@ -4060,11 +4447,25 @@ def evaluate_once(
         all_real_imgs.append(real.detach().cpu())
         all_fake_imgs.append(fake.detach().cpu())
 
-        geo_r, geo_f = geo_features_batch(real, fake, sgs_params, agc_params, det_params, edge_type=edge_type)
+        geo_r, geo_f = geo_features_batch(
+            real,
+            fake,
+            sgs_params,
+            agc_params,
+            det_params,
+            edge_type=evaluation_edge_type,
+        )
         all_real_geo.append(geo_r)
         all_fake_geo.append(geo_f)
 
-        phi_r, phi_f = phi_features_batch(real, fake, sgs_params, agc_params, det_params, edge_type=edge_type)
+        phi_r, phi_f = phi_features_batch(
+            real,
+            fake,
+            sgs_params,
+            agc_params,
+            det_params,
+            edge_type=evaluation_edge_type,
+        )
         all_phi_real.append(phi_r)
         all_phi_fake.append(phi_f)
 
@@ -4080,7 +4481,7 @@ def evaluate_once(
     swd_scales = tuple(int(x) for x in str(getattr(args, "swd_scales", "1,2,4")).split(",") if str(x).strip())
     swd_patch = int(getattr(args, "swd_patch", 7))
     swd_patches = int(getattr(args, "swd_patches", 256))
-    swd_projs = int(getattr(args, "swd_projs", 128))
+    swd_projs = int(getattr(args, "swd_projections", 128))
     swd_scores = multiscale_swd(
         real_imgs_all, fake_imgs_all,
         scales=swd_scales, patch_size=swd_patch, n_patches=swd_patches, n_projections=swd_projs,
@@ -4129,13 +4530,24 @@ def evaluate_once(
         seed=seed + 22300,
     )
 
-    fd_scores = frechet_phi_scores(phi_real, phi_fake)
+    # Standardize phi once from real-reference statistics and reuse the same
+    # coordinates for FD, RR-FD, KID and PRDC.
+    phi_real_n_full, phi_fake_n_full, _, _, phi_valid = standardize_features_by_real(
+        phi_real, phi_fake, eps=1e-8
+    )
+    phi_real_n = phi_real_n_full[:, phi_valid]
+    phi_fake_n = phi_fake_n_full[:, phi_valid]
+
+    fd_scores = frechet_phi_scores(
+        phi_real_n_full, phi_fake_n_full, valid_mask=phi_valid
+    )
     rr_fd = rr_frechet_thresholds(
-        phi_real,
+        phi_real_n_full,
         trials=int(getattr(args, "rr_fd_trials", 20)),
         percentile=float(getattr(args, "rr_fd_percentile", 95.0)),
         min_per_split=int(getattr(args, "rr_fd_min_n", 64)),
         seed=seed + 42345,
+        valid_mask=phi_valid,
     )
     rr_ratio_total = float("nan")
     rr_ratio_structtex = float("nan")
@@ -4149,11 +4561,6 @@ def evaluate_once(
         rr_ratio_spectrum = float(fd_scores["Spectrum"] / (rr_fd["Spectrum"] + 1e-12))
     if rr_fd and ("Energy" in rr_fd) and ("Energy" in fd_scores):
         rr_ratio_energy = float(fd_scores["Energy"] / (rr_fd["Energy"] + 1e-12))
-
-    phi_mu = phi_real.mean(axis=0, keepdims=True)
-    phi_sd = phi_real.std(axis=0, keepdims=True) + 1e-8
-    phi_real_n = (phi_real - phi_mu) / phi_sd
-    phi_fake_n = (phi_fake - phi_mu) / phi_sd
 
     phi_kid_mean, phi_kid_std = kid_poly_mmd2(
         phi_real_n, phi_fake_n,
@@ -4178,6 +4585,12 @@ def evaluate_once(
     out = {
         "seed": int(seed),
         "n": int(n_need),
+
+        "condition_edge_type": str(condition_edge_type),
+        "evaluation_edge_type": str(evaluation_edge_type),
+        "evaluation_pool_seed": int(base_seed),
+        "evaluation_condition_pool_size": int(eval_cond_num),
+        "phi_valid_dimensions": int(np.sum(phi_valid)),
 
         "swd_total": float(swd_scores.get("Total", float("nan"))),
 
@@ -4304,6 +4717,820 @@ def _aggregate_runs(run_dicts: List[Dict[str, Any]]) -> Dict[str, Any]:
             agg[k] = {"mean": float(statistics.mean(vals)), "std": float(statistics.pstdev(vals))}
     return agg
 
+def _summary_stats(values: np.ndarray) -> Dict[str, float]:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+
+    if values.size == 0:
+        return {
+            "mean": float("nan"),
+            "std": float("nan"),
+            "median": float("nan"),
+            "p95": float("nan"),
+        }
+
+    return {
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values, ddof=1)) if values.size > 1 else 0.0,
+        "median": float(np.median(values)),
+        "p95": float(np.percentile(values, 95)),
+    }
+
+
+@torch.no_grad()
+def pairwise_lpips_diversity(
+    images: torch.Tensor,
+    lpips_model: nn.Module,
+    batch_size: int = 8,
+) -> Dict[str, float]:
+    """
+    images: [M,1,H,W] in [-1,1]
+    Computes LPIPS for all M(M-1)/2 pairs.
+    """
+    if images.ndim != 4:
+        raise ValueError(f"Expected [M,C,H,W], got {images.shape}")
+
+    if images.shape[1] == 1:
+        images = images.repeat(1, 3, 1, 1)
+
+    pair_indices = [
+        (i, j)
+        for i in range(images.shape[0])
+        for j in range(i + 1, images.shape[0])
+    ]
+
+    values = []
+
+    for start in range(0, len(pair_indices), batch_size):
+        current_pairs = pair_indices[start:start + batch_size]
+
+        x1 = torch.stack(
+            [images[i] for i, _ in current_pairs],
+            dim=0,
+        )
+        x2 = torch.stack(
+            [images[j] for _, j in current_pairs],
+            dim=0,
+        )
+
+        distance = lpips_model(x1, x2)
+        values.extend(
+            distance.reshape(-1).detach().cpu().numpy().tolist()
+        )
+
+    result = _summary_stats(np.asarray(values))
+    result["n_pairs"] = int(len(values))
+    return result
+
+FAULT_GEOMETRY_NAMES = [
+    "soft_density",
+    "area_fraction",
+    "centroid_x",
+    "centroid_y",
+    "major_spread",
+    "minor_spread",
+    "orientation_cos2",
+    "orientation_sin2",
+    "component_count",
+]
+
+
+def fault_geometry_features_single(
+    image01: np.ndarray,
+    sgs_params: Dict[str, Any],
+    agc_params: Dict[str, Any],
+    det_params: Dict[str, Any],
+    evaluation_edge_type: str = "log",
+    min_component_size: int = 32,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract a fault-likelihood geometry proxy from one image.
+
+    Parameters
+    ----------
+    image01:
+        Grayscale image with shape [H, W] and values in [0, 1].
+    min_component_size:
+        Minimum size, in pixels, retained when counting connected components.
+
+    Returns
+    -------
+    feature:
+        Nine geometry-proxy features in ``FAULT_GEOMETRY_NAMES`` order.
+    fault_map:
+        Continuous fault-likelihood map with shape [H, W].
+    """
+    pp = preprocess_image_once(
+        image01,
+        sgs_params=sgs_params,
+        agc_params=agc_params,
+    )
+
+    edge_map = compute_edge_map_from_preprocessed(
+        pp,
+        det_params=det_params,
+        edge_type=evaluation_edge_type,
+    )
+
+    fault_map = compute_fault_map_from_preprocessed(
+        pp,
+        edge_map=edge_map,
+        det_params=det_params,
+    )
+    fault_map = np.clip(
+        np.nan_to_num(fault_map, nan=0.0, posinf=1.0, neginf=0.0),
+        0.0,
+        1.0,
+    ).astype(np.float64)
+
+    height, width = fault_map.shape
+    yy, xx = np.mgrid[0:height, 0:width]
+    xx = xx / max(width - 1, 1)
+    yy = yy / max(height - 1, 1)
+
+    total_weight = float(fault_map.sum())
+    if total_weight <= 1e-12:
+        centroid_x = 0.5
+        centroid_y = 0.5
+        major_spread = 0.0
+        minor_spread = 0.0
+        orientation_cos2 = 1.0
+        orientation_sin2 = 0.0
+    else:
+        weights = fault_map / total_weight
+        centroid_x = float(np.sum(weights * xx))
+        centroid_y = float(np.sum(weights * yy))
+
+        dx = xx - centroid_x
+        dy = yy - centroid_y
+        covariance = np.array(
+            [
+                [
+                    np.sum(weights * dx * dx),
+                    np.sum(weights * dx * dy),
+                ],
+                [
+                    np.sum(weights * dx * dy),
+                    np.sum(weights * dy * dy),
+                ],
+            ],
+            dtype=np.float64,
+        )
+
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        order = np.argsort(eigenvalues)[::-1]
+        eigenvalues = np.maximum(eigenvalues[order], 0.0)
+        eigenvectors = eigenvectors[:, order]
+
+        major_spread = float(np.sqrt(eigenvalues[0]))
+        minor_spread = float(np.sqrt(eigenvalues[1]))
+
+        principal_vector = eigenvectors[:, 0]
+        orientation = float(
+            np.arctan2(principal_vector[1], principal_vector[0])
+        )
+        orientation_cos2 = float(np.cos(2.0 * orientation))
+        orientation_sin2 = float(np.sin(2.0 * orientation))
+
+    threshold = float(det_params.get("fault_seed_thr", 0.65))
+    binary_map = fault_map >= threshold
+
+    connectivity = np.ones((3, 3), dtype=np.uint8)
+    labels, _ = ndimage.label(binary_map, structure=connectivity)
+    component_sizes = np.bincount(labels.reshape(-1))
+
+    minimum_size = max(1, int(min_component_size))
+    keep_labels = np.flatnonzero(component_sizes >= minimum_size)
+    keep_labels = keep_labels[keep_labels != 0]
+    clean_binary_map = np.isin(labels, keep_labels)
+
+    _, component_count = ndimage.label(
+        clean_binary_map,
+        structure=connectivity,
+    )
+
+    feature = np.array(
+        [
+            float(fault_map.mean()),
+            float(clean_binary_map.mean()),
+            centroid_x,
+            centroid_y,
+            major_spread,
+            minor_spread,
+            orientation_cos2,
+            orientation_sin2,
+            float(component_count),
+        ],
+        dtype=np.float32,
+    )
+
+    return feature, fault_map.astype(np.float32)
+
+@torch.no_grad()
+def generate_fixed_condition_latents(
+    G: nn.Module,
+    condition: torch.Tensor,
+    latents: torch.Tensor,
+    fixed_noise_seed: int,
+) -> torch.Tensor:
+    """
+    condition: [1,C,H,W]
+    latents: [M,z_dim]
+
+    Each forward call uses the same synthesis-noise seed.
+    Therefore, variation primarily comes from z.
+    """
+    outputs = []
+
+    for latent_index in range(latents.shape[0]):
+        # z has already been generated, so resetting the random seed here
+        # fixes only the random sequence used inside the synthesis network.
+        set_seed_all(int(fixed_noise_seed))
+
+        fake = G(
+            latents[latent_index:latent_index + 1],
+            cond_tex=condition,
+            mixing_prob=0.0,
+        )
+
+        fake = torch.nan_to_num(
+            fake,
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        ).clamp(-1.0, 1.0)
+
+        outputs.append(fake.detach().cpu())
+
+    return torch.cat(outputs, dim=0)
+
+@torch.no_grad()
+def fixed_condition_diversity(args):
+    """Evaluate multi-latent diversity under a fixed condition pool.
+
+    The same condition indices, latent vectors, and synthesis-noise seed are
+    reused across conditions and across SLoG/LoG/Canny runs. GEO, phi, and
+    fault-likelihood geometry features are standardized using statistics fitted
+    only on the complete real condition pool.
+    """
+    output_dir = Path(args.out_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if getattr(args, "device", ""):
+        device = torch.device(str(args.device))
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA device requested but CUDA is unavailable: {device}")
+
+    requested_conditions = int(args.diversity_n_conditions)
+    number_of_latents = int(args.diversity_n_latents)
+    lpips_batch_size = int(args.diversity_lpips_batch)
+    standardizer_eps = float(args.diversity_std_eps)
+    minimum_component_size = int(args.fault_component_min_size)
+
+    if requested_conditions < 2:
+        raise ValueError("diversity_n_conditions must be at least 2.")
+    if number_of_latents < 2:
+        raise ValueError("diversity_n_latents must be at least 2.")
+    if lpips_batch_size < 1:
+        raise ValueError("diversity_lpips_batch must be positive.")
+    if standardizer_eps <= 0.0:
+        raise ValueError("diversity_std_eps must be positive.")
+    if minimum_component_size < 1:
+        raise ValueError("fault_component_min_size must be at least 1.")
+
+    amp = bool(getattr(args, "amp", False)) and device.type == "cuda"
+
+    (
+        condition_edge_type,
+        sgs_params,
+        agc_params,
+        det_params,
+        cond_channels,
+    ) = _build_preproc_params(args, device, amp)
+
+    evaluation_edge_type = str(
+        getattr(args, "eval_edge_type", "log")
+    ).strip().lower()
+    if evaluation_edge_type not in ("slog", "glog", "log", "canny"):
+        raise ValueError(
+            "eval_edge_type must be one of slog, glog, log, or canny; "
+            f"got {evaluation_edge_type!r}."
+        )
+
+    # --------------------------------------------------
+    # 1. Load and validate the existing fixed condition pool
+    # --------------------------------------------------
+    eval_pool_path = Path(str(getattr(args, "eval_pool_path", "")).strip())
+    if not str(eval_pool_path):
+        raise ValueError("--eval_pool_path is required for diversity analysis.")
+    if not eval_pool_path.is_file():
+        raise FileNotFoundError(
+            f"Fixed evaluation pool does not exist: {eval_pool_path}"
+        )
+
+    pool_object = torch.load(eval_pool_path, map_location="cpu")
+    if isinstance(pool_object, dict):
+        if "real_crops" not in pool_object:
+            raise KeyError(
+                "The fixed evaluation pool must contain the key 'real_crops'."
+            )
+        fixed_real_images = pool_object["real_crops"]
+        source_indices = pool_object.get(
+            "dataset_indices",
+            list(range(int(fixed_real_images.shape[0]))),
+        )
+    elif torch.is_tensor(pool_object):
+        fixed_real_images = pool_object
+        source_indices = list(range(int(fixed_real_images.shape[0])))
+    else:
+        raise TypeError(
+            "The fixed evaluation pool must be a tensor or a dictionary "
+            "containing 'real_crops'."
+        )
+
+    if not torch.is_tensor(fixed_real_images):
+        fixed_real_images = torch.as_tensor(fixed_real_images)
+    fixed_real_images = fixed_real_images.detach().to(dtype=torch.float32)
+
+    if fixed_real_images.ndim != 4:
+        raise ValueError(
+            "real_crops must have shape [N,C,H,W], got "
+            f"{tuple(fixed_real_images.shape)}."
+        )
+    if fixed_real_images.shape[0] < requested_conditions:
+        raise ValueError(
+            f"The pool contains {fixed_real_images.shape[0]} conditions, "
+            f"but {requested_conditions} were requested."
+        )
+    if fixed_real_images.shape[2] != int(args.img_size) or fixed_real_images.shape[3] != int(args.img_size):
+        raise ValueError(
+            "The fixed pool crop size does not match img_size: "
+            f"pool={tuple(fixed_real_images.shape[2:])}, img_size={args.img_size}."
+        )
+
+    pool_min = float(fixed_real_images.min())
+    pool_max = float(fixed_real_images.max())
+    if pool_min < -1.01 or pool_max > 1.01:
+        raise ValueError(
+            "real_crops are expected in [-1,1], got range "
+            f"[{pool_min:.6f}, {pool_max:.6f}]."
+        )
+
+    source_indices = list(source_indices)
+    if len(source_indices) != int(fixed_real_images.shape[0]):
+        raise ValueError(
+            "dataset_indices length does not match real_crops: "
+            f"{len(source_indices)} versus {fixed_real_images.shape[0]}."
+        )
+
+    eval_cond_num = int(getattr(args, "eval_cond_num", fixed_real_images.shape[0]))
+    if eval_cond_num != int(fixed_real_images.shape[0]):
+        raise ValueError(
+            f"eval_cond_num={eval_cond_num}, but the fixed pool contains "
+            f"{fixed_real_images.shape[0]} crops."
+        )
+
+    in_channels = int(fixed_real_images.shape[1])
+    fixed_real_images = fixed_real_images.to(device)
+
+    # --------------------------------------------------
+    # 2. Load the EMA generator after inferring channels from the pool
+    # --------------------------------------------------
+    G = _load_generator_from_ckpt(
+        args,
+        device,
+        cond_channels=cond_channels,
+        in_ch=in_channels,
+    )
+    G.eval()
+
+    # --------------------------------------------------
+    # 3. Construct each condition exactly once
+    # --------------------------------------------------
+    set_seed_all(int(args.diversity_seed))
+    fixed_conditions = compute_texture_maps_batch(
+        fixed_real_images,
+        sgs_params=sgs_params,
+        agc_params=agc_params,
+        det_params=det_params,
+        device=device,
+        edge_type=condition_edge_type,
+    )
+
+    number_of_conditions = min(
+        requested_conditions,
+        int(fixed_real_images.shape[0]),
+    )
+    condition_indices = np.linspace(
+        0,
+        fixed_real_images.shape[0] - 1,
+        number_of_conditions,
+        dtype=int,
+    ).tolist()
+
+    # --------------------------------------------------
+    # 4. Create one shared latent set for every condition and model
+    # --------------------------------------------------
+    latent_generator = torch.Generator(device="cpu")
+    latent_generator.manual_seed(int(args.diversity_seed))
+    shared_latents = torch.randn(
+        number_of_latents,
+        int(args.z_dim),
+        generator=latent_generator,
+        dtype=torch.float32,
+    ).to(device)
+
+    torch.save(
+        {
+            "latents": shared_latents.detach().cpu(),
+            "seed": int(args.diversity_seed),
+            "n_latents": number_of_latents,
+            "z_dim": int(args.z_dim),
+        },
+        output_dir / "shared_latents.pt",
+    )
+
+    # --------------------------------------------------
+    # 5. Initialize LPIPS
+    # --------------------------------------------------
+    if not _have_lpips:
+        raise ImportError("LPIPS is required. Install it with: pip install lpips")
+    lpips_model = lpips.LPIPS(net="alex").to(device).eval()
+    for parameter in lpips_model.parameters():
+        parameter.requires_grad_(False)
+
+    # --------------------------------------------------
+    # 6. Fit real-reference standardizers on the complete pool
+    # --------------------------------------------------
+    real_geo, _ = geo_features_batch(
+        fixed_real_images,
+        fixed_real_images,
+        sgs_params,
+        agc_params,
+        det_params,
+        edge_type=evaluation_edge_type,
+    )
+    real_phi, _ = phi_features_batch(
+        fixed_real_images,
+        fixed_real_images,
+        sgs_params,
+        agc_params,
+        det_params,
+        edge_type=evaluation_edge_type,
+    )
+
+    geo_mean, geo_std, geo_valid = fit_valid_standardizer(
+        real_geo,
+        eps=standardizer_eps,
+    )
+    phi_mean, phi_std, phi_valid = fit_valid_standardizer(
+        real_phi,
+        eps=standardizer_eps,
+    )
+
+    real_gray01 = _to_gray01_from_tensor(fixed_real_images)
+    real_fault_geometry = []
+    for image in real_gray01:
+        geometry, _ = fault_geometry_features_single(
+            image,
+            sgs_params,
+            agc_params,
+            det_params,
+            evaluation_edge_type=evaluation_edge_type,
+            min_component_size=minimum_component_size,
+        )
+        real_fault_geometry.append(geometry)
+    real_fault_geometry = np.stack(real_fault_geometry, axis=0)
+
+    (
+        fault_geometry_mean,
+        fault_geometry_std,
+        fault_geometry_valid,
+    ) = fit_valid_standardizer(
+        real_fault_geometry,
+        eps=standardizer_eps,
+    )
+
+    def select_valid_group(
+        standardized_features: np.ndarray,
+        valid_mask: np.ndarray,
+        feature_slice: slice,
+        group_name: str,
+    ) -> np.ndarray:
+        group_valid = np.asarray(valid_mask[feature_slice], dtype=bool)
+        if not np.any(group_valid):
+            raise ValueError(
+                f"No valid real-reference dimensions remain for {group_name}."
+            )
+        return standardized_features[:, feature_slice][:, group_valid]
+
+    # --------------------------------------------------
+    # 7. Fixed-condition multi-z evaluation
+    # --------------------------------------------------
+    result_rows: List[Dict[str, Any]] = []
+    geo_structure_sets: List[np.ndarray] = []
+    geo_texture_sets: List[np.ndarray] = []
+    phi_structtex_sets: List[np.ndarray] = []
+    fault_geometry_sets: List[np.ndarray] = []
+
+    for condition_number, pool_index in enumerate(condition_indices):
+        condition_dir = output_dir / f"condition_{condition_number:02d}"
+        condition_dir.mkdir(parents=True, exist_ok=True)
+
+        condition = fixed_conditions[pool_index:pool_index + 1]
+        source_real = fixed_real_images[pool_index:pool_index + 1]
+
+        generated = generate_fixed_condition_latents(
+            G=G,
+            condition=condition,
+            latents=shared_latents,
+            fixed_noise_seed=int(args.diversity_noise_seed),
+        )
+
+        generated01 = ((generated + 1.0) * 0.5).clamp(0.0, 1.0)
+        pixel_variance_map = generated01.var(dim=0, unbiased=True)[0]
+        pixel_var_mean = float(pixel_variance_map.mean())
+        pixel_var_p95 = float(
+            torch.quantile(pixel_variance_map.reshape(-1), 0.95)
+        )
+        active_variance_fraction = float(
+            (pixel_variance_map > 1e-4).float().mean()
+        )
+
+        lpips_result = pairwise_lpips_diversity(
+            generated.to(device),
+            lpips_model=lpips_model,
+            batch_size=lpips_batch_size,
+        )
+
+        fake_device = generated.to(device)
+        _, fake_geo = geo_features_batch(
+            fake_device,
+            fake_device,
+            sgs_params,
+            agc_params,
+            det_params,
+            edge_type=evaluation_edge_type,
+        )
+        _, fake_phi = phi_features_batch(
+            fake_device,
+            fake_device,
+            sgs_params,
+            agc_params,
+            det_params,
+            edge_type=evaluation_edge_type,
+        )
+
+        fake_geo_z = (fake_geo - geo_mean) / geo_std
+        fake_phi_z = (fake_phi - phi_mean) / phi_std
+
+        geo_structure = select_valid_group(
+            fake_geo_z,
+            geo_valid,
+            GEO_FEAT_LAYOUT["Structure"],
+            "GEO Structure",
+        )
+        geo_texture = select_valid_group(
+            fake_geo_z,
+            geo_valid,
+            GEO_FEAT_LAYOUT["Texture"],
+            "GEO Texture",
+        )
+        phi_structtex = select_valid_group(
+            fake_phi_z,
+            phi_valid,
+            PHI_LAYOUT["StructTex"],
+            "phi StructTex",
+        )
+
+        geo_structure_variance = float(
+            np.var(geo_structure, axis=0, ddof=1).mean()
+        )
+        geo_texture_variance = float(
+            np.var(geo_texture, axis=0, ddof=1).mean()
+        )
+        phi_structtex_variance = float(
+            np.var(phi_structtex, axis=0, ddof=1).mean()
+        )
+
+        generated_gray01 = _to_gray01_from_tensor(generated)
+        geometry_features = []
+        for image in generated_gray01:
+            geometry, _ = fault_geometry_features_single(
+                image,
+                sgs_params,
+                agc_params,
+                det_params,
+                evaluation_edge_type=evaluation_edge_type,
+                min_component_size=minimum_component_size,
+            )
+            geometry_features.append(geometry)
+        geometry_features = np.stack(geometry_features, axis=0)
+
+        geometry_z_full = (
+            geometry_features - fault_geometry_mean
+        ) / fault_geometry_std
+        geometry_z = geometry_z_full[:, fault_geometry_valid]
+
+        fault_geometry_variance = float(
+            np.var(geometry_z, axis=0, ddof=1).mean()
+        )
+        centroid_sd = float(
+            np.sqrt(
+                np.var(geometry_features[:, 2], ddof=1)
+                + np.var(geometry_features[:, 3], ddof=1)
+            )
+        )
+        orientation_resultant = float(
+            np.sqrt(
+                np.mean(geometry_features[:, 6]) ** 2
+                + np.mean(geometry_features[:, 7]) ** 2
+            )
+        )
+        orientation_dispersion = float(
+            np.clip(1.0 - orientation_resultant, 0.0, 1.0)
+        )
+
+        # Save an auditable visual record for every selected condition.
+        vutils.save_image(
+            ((source_real.detach().cpu() + 1.0) * 0.5).clamp(0.0, 1.0),
+            condition_dir / "source_real.png",
+            nrow=1,
+        )
+        vutils.save_image(
+            ((condition.detach().cpu() + 1.0) * 0.5).clamp(0.0, 1.0),
+            condition_dir / "condition_channels.png",
+            nrow=max(1, int(condition.shape[1])),
+        )
+        vutils.save_image(
+            generated01,
+            condition_dir / "multi_z_grid.png",
+            nrow=10 if number_of_latents >= 10 else number_of_latents,
+        )
+        vutils.save_image(
+            generated01.mean(dim=0, keepdim=True),
+            condition_dir / "mean_image.png",
+            nrow=1,
+        )
+
+        normalized_variance = pixel_variance_map / (
+            pixel_variance_map.max() + 1e-12
+        )
+        vutils.save_image(
+            normalized_variance.unsqueeze(0),
+            condition_dir / "pixel_variance_map.png",
+            nrow=1,
+        )
+        np.save(
+            condition_dir / "pixel_variance.npy",
+            pixel_variance_map.numpy(),
+        )
+        np.save(
+            condition_dir / "fault_likelihood_geometry.npy",
+            geometry_features,
+        )
+
+        source_index_value = source_indices[pool_index]
+        if torch.is_tensor(source_index_value):
+            source_index_value = source_index_value.item()
+
+        result_rows.append(
+            {
+                "condition_number": int(condition_number),
+                "pool_index": int(pool_index),
+                "source_index": int(source_index_value),
+                "n_latents": number_of_latents,
+                "pixel_variance_mean": pixel_var_mean,
+                "pixel_variance_p95": pixel_var_p95,
+                "active_variance_fraction": active_variance_fraction,
+                "lpips_mean": lpips_result["mean"],
+                "lpips_std": lpips_result["std"],
+                "lpips_median": lpips_result["median"],
+                "lpips_p95": lpips_result["p95"],
+                "lpips_n_pairs": lpips_result["n_pairs"],
+                "geo_structure_variance_z": geo_structure_variance,
+                "geo_texture_variance_z": geo_texture_variance,
+                "phi_structtex_variance_z": phi_structtex_variance,
+                "fault_likelihood_geometry_variance_z": fault_geometry_variance,
+                "fault_likelihood_centroid_sd": centroid_sd,
+                "fault_likelihood_orientation_dispersion": orientation_dispersion,
+            }
+        )
+
+        geo_structure_sets.append(geo_structure)
+        geo_texture_sets.append(geo_texture)
+        phi_structtex_sets.append(phi_structtex)
+        fault_geometry_sets.append(geometry_z)
+
+    # --------------------------------------------------
+    # 8. Within-condition / between-condition decomposition
+    # --------------------------------------------------
+    def within_between_ratio(
+        feature_sets: List[np.ndarray],
+    ) -> Dict[str, float]:
+        if len(feature_sets) < 2:
+            raise ValueError("At least two conditions are required.")
+        if any(features.shape[0] < 2 for features in feature_sets):
+            raise ValueError("At least two latent samples per condition are required.")
+
+        within = float(
+            np.mean(
+                [
+                    np.var(features, axis=0, ddof=1).mean()
+                    for features in feature_sets
+                ]
+            )
+        )
+        condition_means = np.stack(
+            [features.mean(axis=0) for features in feature_sets],
+            axis=0,
+        )
+        between = float(
+            np.var(condition_means, axis=0, ddof=1).mean()
+        )
+        return {
+            "within": within,
+            "between": between,
+            "within_between_ratio": float(within / (between + 1e-12)),
+        }
+
+    summary_metric_names = [
+        "pixel_variance_mean",
+        "pixel_variance_p95",
+        "active_variance_fraction",
+        "lpips_mean",
+        "geo_structure_variance_z",
+        "geo_texture_variance_z",
+        "phi_structtex_variance_z",
+        "fault_likelihood_geometry_variance_z",
+        "fault_likelihood_centroid_sd",
+        "fault_likelihood_orientation_dispersion",
+    ]
+    condition_level_summary = {
+        metric_name: _summary_stats(
+            np.asarray(
+                [row[metric_name] for row in result_rows],
+                dtype=np.float64,
+            )
+        )
+        for metric_name in summary_metric_names
+    }
+
+    aggregate = {
+        "checkpoint": str(Path(args.ckpt_path).resolve()),
+        "evaluation_pool": str(eval_pool_path.resolve()),
+        "pool_size": int(fixed_real_images.shape[0]),
+        "n_conditions": number_of_conditions,
+        "n_latents_per_condition": number_of_latents,
+        "condition_indices": condition_indices,
+        "source_indices": [
+            int(source_indices[index].item())
+            if torch.is_tensor(source_indices[index])
+            else int(source_indices[index])
+            for index in condition_indices
+        ],
+        "latent_seed": int(args.diversity_seed),
+        "fixed_synthesis_noise_seed": int(args.diversity_noise_seed),
+        "condition_edge_type": condition_edge_type,
+        "evaluation_edge_type": evaluation_edge_type,
+        "tex_layout": str(args.tex_layout),
+        "standardizer_eps": standardizer_eps,
+        "fault_component_min_size": minimum_component_size,
+        "geo_valid_dimensions": int(np.sum(geo_valid)),
+        "phi_valid_dimensions": int(np.sum(phi_valid)),
+        "fault_geometry_valid_dimensions": int(np.sum(fault_geometry_valid)),
+        "fault_geometry_feature_names": FAULT_GEOMETRY_NAMES,
+        "condition_level_summary": condition_level_summary,
+        "geo_structure": within_between_ratio(geo_structure_sets),
+        "geo_texture": within_between_ratio(geo_texture_sets),
+        "phi_structtex": within_between_ratio(phi_structtex_sets),
+        "fault_likelihood_geometry": within_between_ratio(fault_geometry_sets),
+    }
+
+    csv_path = output_dir / "fixed_condition_diversity.csv"
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=list(result_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(result_rows)
+
+    summary_csv_path = output_dir / "fixed_condition_diversity_summary.csv"
+    with summary_csv_path.open("w", newline="", encoding="utf-8-sig") as file:
+        fieldnames = ["metric", "mean", "std", "median", "p95"]
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for metric_name, statistics_dict in condition_level_summary.items():
+            writer.writerow({"metric": metric_name, **statistics_dict})
+
+    with (
+        output_dir / "fixed_condition_diversity_summary.json"
+    ).open("w", encoding="utf-8") as file:
+        json.dump(aggregate, file, indent=2, ensure_ascii=False)
+
+    print(f"Diversity analysis completed: {output_dir}")
+    print(json.dumps(aggregate, indent=2, ensure_ascii=False))
+
 def test(args):
     os.makedirs(args.out_dir, exist_ok=True)
     logger = setup_logger(args.out_dir, "test")
@@ -4316,8 +5543,13 @@ def test(args):
         device = torch.device("cuda" if torch.cuda.is_available() and int(getattr(args, "gpus", 1)) > 0 else "cpu")
     amp = (bool(getattr(args, "amp", False)) and device.type == "cuda")
 
-    # build params
-    edge_type, sgs_params, agc_params, det_params, cond_channels = _build_preproc_params(args, device, amp)
+    condition_edge_type, sgs_params, agc_params, det_params, cond_channels = (
+        _build_preproc_params(args, device, amp)
+    )
+
+    evaluation_edge_type = str(
+        getattr(args, "eval_edge_type", "log")
+    ).strip().lower()
 
     # infer in_ch from one sample
     ds_tmp = ImageFolderDataset(args.data_dir, crop_size=args.img_size)
@@ -4342,9 +5574,15 @@ def test(args):
         for r in range(repeats):
             run_seed = int(s + r * 100000)
             out = evaluate_once(
-                args=args, device=device, G=G,
-                sgs_params=sgs_params, agc_params=agc_params, det_params=det_params,
-                edge_type=edge_type, seed=run_seed
+                args=args,
+                device=device,
+                G=G,
+                sgs_params=sgs_params,
+                agc_params=agc_params,
+                det_params=det_params,
+                condition_edge_type=condition_edge_type,
+                evaluation_edge_type=evaluation_edge_type,
+                seed=run_seed,
             )
             runs.append(out)
             jlog.write(out)
@@ -4377,7 +5615,12 @@ def test(args):
                 f"PHI_PRDC@k5 P={out.get('phi_prdc_k5_p_mean', float('nan')):.3f}[{out.get('phi_prdc_k5_p_lo', float('nan')):.3f},{out.get('phi_prdc_k5_p_hi', float('nan')):.3f}] "
                 f"R={out.get('phi_prdc_k5_r_mean', float('nan')):.3f}[{out.get('phi_prdc_k5_r_lo', float('nan')):.3f},{out.get('phi_prdc_k5_r_hi', float('nan')):.3f}] "
                 f"D={out.get('phi_prdc_k5_d_mean', float('nan')):.3f}[{out.get('phi_prdc_k5_d_lo', float('nan')):.3f},{out.get('phi_prdc_k5_d_hi', float('nan')):.3f}] "
-                f"C={out.get('phi_prdc_k5_c_mean', float('nan')):.3f}[{out.get('phi_prdc_k5_c_lo', float('nan')):.3f},{out.get('phi_prdc_k5_c_hi', float('nan')):.3f}]"
+                f"C={out.get('phi_prdc_k5_c_mean', float('nan')):.3f}[{out.get('phi_prdc_k5_c_lo', float('nan')):.3f},{out.get('phi_prdc_k5_c_hi', float('nan')):.3f}] | "
+                f"TEST ckpt={args.ckpt_path} | "
+                f"condition_edge={condition_edge_type} | "
+                f"evaluation_edge={evaluation_edge_type} | "
+                f"data_dir={args.data_dir} | "
+                f"seeds={seeds} | repeats={repeats}"
             )
 
     agg = _aggregate_runs(runs)
@@ -4397,21 +5640,412 @@ def test(args):
                 f"RRFD_ratio_total={_p('rr_fd_ratio_total')}|"
                 f"PHI_KID_mean={_p('phi_kid_mean')}")
     print("Test finished.")
+
+@torch.no_grad()
+def generate_downstream_dataset(args):
+    """
+    按输入图像顺序，每个真实条件生成一张合成图，
+    并按照原始数字文件名保存。
+    """
+
+    # --------------------------------------------------------
+    # 1. 设备和随机种子
+    # --------------------------------------------------------
+    if getattr(args, "device", ""):
+        device = torch.device(str(args.device))
+    else:
+        device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            and int(getattr(args, "gpus", 1)) > 0
+            else "cpu"
+        )
+
+    amp_enabled = (
+        bool(getattr(args, "amp", False))
+        and device.type == "cuda"
+    )
+
+    generate_seed = int(
+        getattr(args, "generate_seed", 43000)
+    )
+
+    set_seed_all(generate_seed)
+
+    # --------------------------------------------------------
+    # 2. 输出目录
+    # --------------------------------------------------------
+    output_root = Path(args.out_dir)
+    image_output_dir = output_root / "images"
+    label_output_dir = output_root / "labels"
+
+    overwrite = bool(
+        getattr(args, "overwrite_generate", False)
+    )
+
+    if output_root.exists() and any(output_root.iterdir()):
+        if not overwrite:
+            raise FileExistsError(
+                f"Output directory is not empty: {output_root}\n"
+                "Use --overwrite_generate to replace it."
+            )
+
+        shutil.rmtree(output_root)
+
+    image_output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    label_output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # --------------------------------------------------------
+    # 3. 读取350对图像和标签
+    # --------------------------------------------------------
+    dataset = PairedGenerationDataset(
+        image_dir=args.data_dir,
+        label_dir=args.label_dir,
+        img_size=args.img_size,
+        expected_num=args.generate_num,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=args.generate_batch,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    print(
+        f"[generate] paired samples: {len(dataset)}"
+    )
+
+    # --------------------------------------------------------
+    # 4. 建立条件预处理参数
+    # --------------------------------------------------------
+    (
+        condition_edge_type,
+        sgs_params,
+        agc_params,
+        det_params,
+        cond_channels,
+    ) = _build_preproc_params(
+        args,
+        device,
+        amp_enabled,
+    )
+
+    # 输入固定为单通道灰度
+    in_ch = 1
+
+    # --------------------------------------------------------
+    # 5. 加载生成器
+    # --------------------------------------------------------
+    G = _load_generator_from_ckpt(
+        args,
+        device,
+        cond_channels=cond_channels,
+        in_ch=in_ch,
+    )
+
+    apply_g_bounds_(G, args)
+    G.eval()
+
+    # --------------------------------------------------------
+    # 6. CSV记录
+    # --------------------------------------------------------
+    manifest_path = (
+        output_root / "generation_manifest.csv"
+    )
+
+    manifest_fields = [
+        "image_id",
+        "source_image",
+        "source_label",
+        "synthetic_image",
+        "copied_label",
+        "condition_edge_type",
+        "tex_layout",
+        "checkpoint",
+        "latent_seed",
+        "generate_seed",
+    ]
+
+    preview_real = []
+    preview_fake = []
+
+    generated_count = 0
+
+    with manifest_path.open(
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as csv_file:
+
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=manifest_fields,
+        )
+        writer.writeheader()
+
+        for batch in tqdm(
+            loader,
+            desc="Generating downstream dataset",
+        ):
+            real = batch["image"].to(
+                device,
+                non_blocking=True,
+            )
+
+            image_ids = [
+                int(x)
+                for x in batch["image_id"]
+            ]
+
+            source_image_paths = list(
+                batch["image_path"]
+            )
+            source_label_paths = list(
+                batch["label_path"]
+            )
+
+            # ----------------------------------------------
+            # 条件通道
+            # ----------------------------------------------
+            cond_tex = compute_texture_maps_batch(
+                real,
+                sgs_params=sgs_params,
+                agc_params=agc_params,
+                det_params=det_params,
+                device=device,
+                edge_type=condition_edge_type,
+            )
+
+            # ----------------------------------------------
+            # 每个编号使用固定潜变量
+            # ----------------------------------------------
+            z, latent_seeds = make_latent_batch(
+                image_ids=image_ids,
+                z_dim=args.z_dim,
+                base_seed=generate_seed,
+                device=device,
+            )
+
+            # ----------------------------------------------
+            # 生成图像
+            # ----------------------------------------------
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=amp_enabled,
+            ):
+                fake = G(
+                    z,
+                    cond_tex=cond_tex,
+                    mixing_prob=0.0,
+                )
+
+            fake = torch.nan_to_num(
+                fake,
+                nan=0.0,
+                posinf=1.0,
+                neginf=-1.0,
+            )
+            fake = fake.clamp(-1.0, 1.0)
+
+            # ----------------------------------------------
+            # 按原始文件编号保存
+            # ----------------------------------------------
+            for local_index, image_id in enumerate(image_ids):
+                output_name = f"{image_id}.png"
+
+                synthetic_path = (
+                    image_output_dir / output_name
+                )
+                copied_label_path = (
+                    label_output_dir / output_name
+                )
+
+                vutils.save_image(
+                    (fake[local_index:local_index + 1] + 1.0)
+                    / 2.0,
+                    synthetic_path,
+                    nrow=1,
+                    normalize=False,
+                )
+
+                # 标签统一保存成PNG，不进行缩放或插值
+                with Image.open(
+                    source_label_paths[local_index]
+                ) as label_image:
+                    label_image = label_image.convert("L")
+                    label_image.save(
+                        copied_label_path,
+                        format="PNG",
+                    )
+
+                writer.writerow({
+                    "image_id": image_id,
+                    "source_image":
+                        source_image_paths[local_index],
+                    "source_label":
+                        source_label_paths[local_index],
+                    "synthetic_image":
+                        str(synthetic_path.resolve()),
+                    "copied_label":
+                        str(copied_label_path.resolve()),
+                    "condition_edge_type":
+                        condition_edge_type,
+                    "tex_layout":
+                        args.tex_layout,
+                    "checkpoint":
+                        str(Path(args.ckpt_path).resolve()),
+                    "latent_seed":
+                        latent_seeds[local_index],
+                    "generate_seed":
+                        generate_seed,
+                })
+
+                generated_count += 1
+
+            if len(preview_real) < 16:
+                remain = 16 - len(preview_real)
+                cur = min(remain, real.shape[0])
+
+                preview_real.extend(
+                    real[:cur].detach().cpu()
+                )
+                preview_fake.extend(
+                    fake[:cur].detach().cpu()
+                )
+
+    # --------------------------------------------------------
+    # 7. 数量检查
+    # --------------------------------------------------------
+    expected_num = int(args.generate_num)
+
+    if generated_count != expected_num:
+        raise RuntimeError(
+            f"Expected {expected_num} generated images, "
+            f"but saved {generated_count}."
+        )
+
+    saved_images = list(
+        image_output_dir.glob("*.png")
+    )
+    saved_labels = list(
+        label_output_dir.glob("*.png")
+    )
+
+    if len(saved_images) != expected_num:
+        raise RuntimeError(
+            f"Synthetic image count mismatch: "
+            f"{len(saved_images)}"
+        )
+
+    if len(saved_labels) != expected_num:
+        raise RuntimeError(
+            f"Copied label count mismatch: "
+            f"{len(saved_labels)}"
+        )
+
+    # --------------------------------------------------------
+    # 8. 预览图
+    # --------------------------------------------------------
+    if preview_real:
+        preview_real_tensor = torch.stack(
+            preview_real,
+            dim=0,
+        )
+        preview_fake_tensor = torch.stack(
+            preview_fake,
+            dim=0,
+        )
+
+        vutils.save_image(
+            (preview_real_tensor + 1.0) / 2.0,
+            output_root / "preview_real.png",
+            nrow=4,
+        )
+
+        vutils.save_image(
+            (preview_fake_tensor + 1.0) / 2.0,
+            output_root / "preview_fake.png",
+            nrow=4,
+        )
+
+    # --------------------------------------------------------
+    # 9. 保存本次配置
+    # --------------------------------------------------------
+    config = {
+        "mode": "generate",
+        "generated_count": generated_count,
+        "data_dir": str(Path(args.data_dir).resolve()),
+        "label_dir": str(Path(args.label_dir).resolve()),
+        "out_dir": str(output_root.resolve()),
+        "checkpoint": str(Path(args.ckpt_path).resolve()),
+        "condition_edge_type": condition_edge_type,
+        "tex_layout": args.tex_layout,
+        "img_size": int(args.img_size),
+        "z_dim": int(args.z_dim),
+        "generate_seed": generate_seed,
+        "generate_batch": int(args.generate_batch),
+        "test_mixing_prob": 0.0,
+        "amp": amp_enabled,
+    }
+
+    with (
+        output_root / "generation_config.json"
+    ).open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            config,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print("\nGeneration finished.")
+    print(f"Algorithm: {condition_edge_type}")
+    print(f"Generated images: {generated_count}")
+    print(f"Images: {image_output_dir}")
+    print(f"Labels: {label_output_dir}")
+    print(f"Manifest: {manifest_path}")
+
 # -------------------------
 # CLI / main
 # -------------------------
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, required=True, choices=['train','test'], help='train or test')
-    parser.add_argument('--ckpt_path', type=str, default='', help='checkpoint path (.pth) for --mode test')
+    parser.add_argument("--mode",type=str,required=True,choices=["train", "test", "generate", "diversity"],help="train, test, generate downstream dataset, or fixed-condition diversity analysis",)
+    parser.add_argument("--diversity_n_conditions",type=int,default=20,help="number of fixed conditions used for diversity analysis",)
+    parser.add_argument("--diversity_n_latents", type=int, default=50, help="number of latent samples generated for each fixed condition")
+    parser.add_argument("--diversity_seed", type=int, default=46000, help="base seed used to generate the shared latent set")
+    parser.add_argument("--diversity_noise_seed", type=int, default=2026, help="fixed synthesis-noise seed used to isolate latent variation")
+    parser.add_argument("--diversity_lpips_batch", type=int, default=8, help="batch size used for pairwise LPIPS calculation")
+    parser.add_argument("--diversity_std_eps", type=float, default=1e-6, help="minimum real-reference standard deviation retained for diversity features")
+    parser.add_argument("--fault_component_min_size", type=int, default=32, help="minimum connected-component size for the fault-likelihood geometry proxy")
+
+    parser.add_argument('--ckpt_path', type=str, default="", help='checkpoint path (.pth) for --mode test')
     parser.add_argument('--seeds', type=str, default='43,44,45,46,47', help='comma-separated seeds for testing, e.g. 42,43,44,45,46')
     parser.add_argument('--repeats', type=int, default=30, help='how many repeats per seed (seed offseted)')
     parser.add_argument('--test_mixing_prob', type=float, default=0.0, help='style mixing prob during test (usually 0)')
     parser.add_argument('--save_test_images', default=True, help='save some real/fake grids per seed')
     parser.add_argument('--device', type=str, default='cuda:0', help='torch device override, e.g. cuda:0 or cpu')
-
-    parser.add_argument('--data_dir', type=str, required=True, help="path to training images")
-    parser.add_argument('--out_dir', type=str, default="outputs/stylegan_experiment")
+    parser.add_argument("--label_dir",type=str,default="",help="paired fault-label directory for generation mode",)
+    parser.add_argument("--generate_num",type=int,default=350,help="expected number of image-label pairs",)
+    parser.add_argument("--generate_batch",type=int,default=8,help="batch size used only in generation mode",)
+    parser.add_argument("--generate_seed",type=int,default=43000,help="base seed for deterministic per-image latent codes",)
+    parser.add_argument("--overwrite_generate",action="store_true",help="delete and recreate a non-empty generation output directory",)
+    parser.add_argument("--strict_generate_ckpt",action="store_true",help="stop if checkpoint keys do not exactly match generator",)
+    parser.add_argument('--data_dir', type=str, default="", help="path to training images")
+    parser.add_argument('--out_dir', type=str, default="")
     parser.add_argument('--d_lr', type=float, default=5e-5)
     parser.add_argument('--g_lr', type=float, default=1e-4)
     parser.add_argument('--d_lr_decay_start', type=int, default=10000)
@@ -4429,11 +6063,14 @@ if __name__ == '__main__':
     parser.add_argument('--save_interval', type=int, default=500)
     parser.add_argument('--eval_interval', type=int, default=500)
     parser.add_argument('--eval_n', type=int, default=256)
+    parser.add_argument('--eval_cond_num',type=int,default=256,help='number of fixed real crops in the shared evaluation condition pool',)
+    parser.add_argument('--eval_edge_type',type=str,default='log',choices=['slog', 'glog', 'log', 'canny'],help='common edge operator used only for GEO and phi feature extraction',)
+    parser.add_argument('--eval_pool_path',type=str,default="",help='path used to save or load the shared real-crop evaluation pool',)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--style_mixing_prob', type=float, default=0.5,
                         help='probability of applying style-mixing per-sample during training (0..1). 0 disables mixing.')
-    parser.add_argument('--edge_type',type=str,default='glog',choices=['glog', 'log', 'canny'],
+    parser.add_argument('--edge_type',type=str,default='glog',choices=['slog','glog', 'log', 'canny'],
                         help='edge / texture detector after nlmeans+SGS+AGC. glog applies cv2.normalize to suppress background.')
     parser.add_argument('--tex_layout', type=str, default='fault,agc,edge',
                         help="Comma-separated cond channels: edge,coherence,ori_sin,ori_cos,sgs,agc,hp,gray,fault. ")
@@ -4610,14 +6247,47 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    if args.mode == 'train':
-        # seeds for training
+    if args.mode == "train":
+        os.makedirs(args.out_dir, exist_ok=True)
+
         torch.manual_seed(args.seed)
         random.seed(args.seed)
         np.random.seed(args.seed)
+
         train(args)
-    else:
+
+    elif args.mode == "test":
         if not args.ckpt_path:
-            raise ValueError('--ckpt_path is required for --mode test')
+            raise ValueError(
+                "--ckpt_path is required for --mode test"
+            )
+
+        os.makedirs(args.out_dir, exist_ok=True)
         test(args)
+
+    elif args.mode == "generate":
+        if not args.ckpt_path:
+            raise ValueError(
+                "--ckpt_path is required for --mode generate"
+            )
+
+        if not args.label_dir:
+            raise ValueError(
+                "--label_dir is required for --mode generate"
+            )
+
+        generate_downstream_dataset(args)
+        
+    elif args.mode == "diversity":
+        if not args.ckpt_path:
+            raise ValueError(
+                "--ckpt_path is required for --mode diversity"
+            )
+
+        os.makedirs(args.out_dir, exist_ok=True)
+        fixed_condition_diversity(args)
+
+    else:
+        raise ValueError(
+            f"Unknown mode: {args.mode}"
+        )
