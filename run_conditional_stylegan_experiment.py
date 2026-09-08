@@ -12,13 +12,26 @@ generate:
 diversity:
     Evaluate latent-code sensitivity under fixed conditions and fixed
     synthesis noise.
+
+Experiment profiles
+-------------------
+--profile australian reproduces the 512x512 Australian within-volume protocol.
+--profile f3 reproduces the 128x128 edge-independent F3 stress-test protocol.
+The model implementation is shared; only survey-specific preprocessing,
+conditioning, augmentation geometry, and discriminator patch scales differ.
 """
 import os, math, random, argparse, time,json,statistics
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+os.environ["NUMEXPR_NUM_THREADS"] = "2"
 from pathlib import Path
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
 import torch
+torch.set_num_threads(2)
+torch.set_num_interop_threads(1)
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -596,7 +609,11 @@ def generalized_oriented_log_factory_gpu(
     return detector
 
 def apply_detector_generalized_log(agc: np.ndarray, ori: np.ndarray, coh: np.ndarray, Dxx: np.ndarray, Dxy: np.ndarray, Dyy: np.ndarray, merged_det: Dict[str,Any]) -> np.ndarray:
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = merged_det.get("device", None)
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif not isinstance(device, torch.device):
+        device = torch.device(str(device))
     det = generalized_oriented_log_factory_gpu(
         sigma=float(merged_det.get("glog_sigma", 1.1)),
         anisotropy=float(merged_det.get("glog_anisotropy", 2.3)),
@@ -1014,30 +1031,34 @@ class ImageFolderDataset(Dataset):
         img = Image.open(p).convert("L")
         W, H = img.size
 
-        if W < self.crop or H < self.crop:
-            scale = max(self.crop / W, self.crop / H)
-            new_w = int(round(W * scale))
-            new_h = int(round(H * scale))
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-            W, H = img.size
+        # If a field image is already exactly the requested size (the F3
+        # protocol uses 128x128 prepared images), keep it unchanged.  For the
+        # Australian source profiles, retain the original dynamic crop logic.
+        if W == self.crop and H == self.crop:
+            crop = img
+        else:
+            if W < self.crop or H < self.crop:
+                scale = max(self.crop / W, self.crop / H)
+                new_w = int(round(W * scale))
+                new_h = int(round(H * scale))
+                img = img.resize((new_w, new_h), Image.LANCZOS)
+                W, H = img.size
 
-        ratio = idx / max(1, (self.n - 1))
+            ratio = idx / max(1, (self.n - 1))
+            full_max_left = max(0, W - self.crop)
+            curr_max_left = int(round(self.start_max_left * (1 - ratio) + full_max_left * ratio))
+            left = random.randint(0, curr_max_left)
 
-        full_max_left = max(0, W - self.crop)
-        curr_max_left = int(round(self.start_max_left * (1 - ratio) + full_max_left * ratio))
-
-        left = random.randint(0, curr_max_left)
-
-        y_min = max(0, H - 600)
-        y_max = max(0, H - self.crop)
-        if y_min > y_max:
-            y_min = 0
+            y_min = max(0, H - 600)
             y_max = max(0, H - self.crop)
-        top = random.randint(y_min, y_max)
+            if y_min > y_max:
+                y_min = 0
+                y_max = max(0, H - self.crop)
+            top = random.randint(y_min, y_max)
 
-        right = left + self.crop
-        bottom = top + self.crop
-        crop = img.crop((left, top, right, bottom))
+            right = left + self.crop
+            bottom = top + self.crop
+            crop = img.crop((left, top, right, bottom))
         t = T.ToTensor()(crop)  # (1,H,W)
         t = T.Normalize([0.5], [0.5])(t)  # 1ch
         return t
@@ -2057,6 +2078,30 @@ def geo_features_batch(real_imgs: torch.Tensor,
 
     return np.stack(real_list, axis=0), np.stack(fake_list, axis=0)
 
+def geo_features_only(
+    imgs: torch.Tensor,
+    sgs_params,
+    agc_params,
+    det_params,
+    edge_type="glog",
+):
+    gray = _to_gray01_from_tensor(imgs)
+
+    out = []
+
+    for i in range(gray.shape[0]):
+        out.append(
+            _geo_features_single(
+                gray[i],
+                sgs_params,
+                agc_params,
+                det_params,
+                edge_type=edge_type,
+            )
+        )
+
+    return np.stack(out, axis=0)
+
 def estimate_mmd_gamma_median(Z: np.ndarray, max_points: int = 400, seed: int = 0) -> float:
     Z = Z.astype(np.float64)
     n = Z.shape[0]
@@ -2313,6 +2358,30 @@ def phi_features_batch(real_imgs: torch.Tensor,
         R.append(phi_features_single(real_gray[i], sgs_params, agc_params, det_params, edge_type=edge_type))
         F.append(phi_features_single(fake_gray[i], sgs_params, agc_params, det_params, edge_type=edge_type))
     return np.stack(R, 0), np.stack(F, 0)
+
+def phi_features_only(
+    imgs: torch.Tensor,
+    sgs_params,
+    agc_params,
+    det_params,
+    edge_type="glog",
+):
+    gray = _to_gray01_from_tensor(imgs)
+
+    out = []
+
+    for i in range(gray.shape[0]):
+        out.append(
+            phi_features_single(
+                gray[i],
+                sgs_params,
+                agc_params,
+                det_params,
+                edge_type=edge_type,
+            )
+        )
+
+    return np.stack(out, axis=0)
 
 def frechet_distance(mu1, cov1, mu2, cov2, eps=1e-6) -> float:
     mu1 = np.atleast_1d(mu1).astype(np.float64)
@@ -3054,7 +3123,8 @@ def seismic_physics_aug(real: torch.Tensor, p: float,
                         gamma_range=(0.85, 1.15),
                         noise_std_range=(0.0, 0.04),
                         blur_sigma_range=(0.0, 1.2),
-                        device=None) -> torch.Tensor:
+                        device=None,
+                        stable_gamma: bool = False) -> torch.Tensor:
 
     if p <= 0.0:
         return real
@@ -3076,9 +3146,19 @@ def seismic_physics_aug(real: torch.Tensor, p: float,
             xi = xi * g
 
         if random.random() < p:
-            # 2) random gamma (amplitude nonlinearity)
+            # 2) random gamma (amplitude nonlinearity).  The F3 profile uses
+            # the stabilized endpoint-preserving implementation from the
+            # field-domain runs; Australian training retains the original map.
             gm = random.uniform(*gamma_range)
-            xi = torch.clamp(xi, 0.0, 1.0) ** gm
+            xi = torch.clamp(xi, 0.0, 1.0)
+            if stable_gamma:
+                eps_gamma = 1e-6
+                y0 = eps_gamma ** gm
+                y1 = (1.0 + eps_gamma) ** gm
+                xi = ((xi + eps_gamma).pow(gm) - y0) / (y1 - y0)
+                xi = torch.clamp(xi, 0.0, 1.0)
+            else:
+                xi = xi ** gm
 
         if random.random() < p:
             # 3) noise
@@ -3187,6 +3267,62 @@ class AdaptiveStructureController:
                 "mul_ori": float(self.mul_ori)}
         
 # -------------------------
+# Experiment profiles
+# -------------------------
+def _experiment_profile(args) -> str:
+    profile = str(getattr(args, "profile", "australian")).strip().lower()
+    if profile not in ("australian", "f3"):
+        raise ValueError(f"Unknown experiment profile: {profile}")
+    return profile
+
+def _profile_config(args) -> Dict[str, Any]:
+    profile = _experiment_profile(args)
+    if profile == "f3":
+        return {
+            "img_size": 128,
+            "epochs": 253,
+            "sgs_sigma": 2.5,
+            "sgs_anisotropy": 2.5,
+            "sgs_gamma": 0.04,
+            "agc_window": 11,
+            "agc_p1": 3,
+            "fault_w_coh": 0.6470588,
+            "fault_w_ori": 0.3529412,
+            "fault_w_edge": 0.0,
+            "ada_pad": 5,
+            "ada_translation_px": 1,
+            "patch_scales": (1.0, 0.5),
+            "cond_struct_block_size": 6,
+            "edge_block_size": 4,
+            "stable_gamma": True,
+        }
+    return {
+        "img_size": 512,
+        "epochs": 1000,
+        "sgs_sigma": 1.5,
+        "sgs_anisotropy": 2.2,
+        "sgs_gamma": 0.06,
+        "agc_window": 31,
+        "agc_p1": 1,
+        "fault_w_coh": 0.55,
+        "fault_w_ori": 0.30,
+        "fault_w_edge": 0.15,
+        "ada_pad": 20,
+        "ada_translation_px": 2,
+        "patch_scales": (1.0, 0.5, 0.25),
+        "cond_struct_block_size": 24,
+        "edge_block_size": 16,
+        "stable_gamma": False,
+    }
+
+def _apply_profile_cli_defaults(args):
+    cfg = _profile_config(args)
+    for name in ("img_size", "epochs", "cond_struct_block_size", "edge_block_size"):
+        if getattr(args, name, None) is None:
+            setattr(args, name, cfg[name])
+    return args
+
+# -------------------------
 # Training loop
 # -------------------------
 def train(args):
@@ -3206,16 +3342,26 @@ def train(args):
             f"eval_edge_type must be one of ['slog','glog','log','canny'], "
             f"got '{evaluation_edge_type}'"
         )
-    device = torch.device('cuda' if torch.cuda.is_available() and args.gpus>0 else 'cpu')
+    if getattr(args, "device", ""):
+        device = torch.device(str(args.device))
+    else:
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() and args.gpus > 0 else "cpu"
+        )
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA requested but unavailable: {device}")
+        torch.cuda.set_device(device)
     print('Device:', device)
     amp = (args.amp and device.type == 'cuda')
+    profile_cfg = _profile_config(args)
 
     logger = setup_logger(args.out_dir, "train")
     jlog   = JsonlWriter(os.path.join(args.out_dir, "metrics_train.jsonl"))
     elog   = JsonlWriter(os.path.join(args.out_dir, "metrics_eval.jsonl"))
 
     logger.info(
-        f"Device={device} | AMP={amp} | img_size={args.img_size} | "
+        f"Profile={args.profile} | Device={device} | AMP={amp} | img_size={args.img_size} | "
         f"batch={args.batch} | epochs={args.epochs} | condition_edge={edge_type} | "
         f"evaluation_edge={evaluation_edge_type} | tex_layout={args.tex_layout}"
     )
@@ -3278,67 +3424,11 @@ def train(args):
     swd_patches = int(getattr(args, "swd_patches", 256))
     swd_projections = int(getattr(args, "swd_projections", 128))
     
-    sgs_params = {
-        "sigma": 1.5,
-        "anisotropy": 2.2,
-        "iterations": 1,
-        "base_kappa": 10.0,
-        "gamma": 0.06,
-        "device": device,
-        "prefer_fp16": amp,
-        "nl_h": 0.8,
-    }
-    agc_params = {
-        "window": 31,
-        "eps": 1e-8,
-        "p1": 1,
-    }
-    det_params = {
-        "tex_layout": args.tex_layout,
-        
-        "glog_sigma": 0.4,
-        "glog_anisotropy": 2.1,
-        "glog_nangles": 8,
-        "glog_sharpness": 14.0,
-        "glog_alpha": 0.92,
-        
-        "glog_aniso_clip": 4.0,
-        "glog_gamma_scale": 1.0,
-        "glog_dist_mode": "relative",
-
-        "log_sigma": 1.1,
-        "canny_sigma": 1.7,
-        "canny_low": 0.1,
-        "canny_high": 0.9,
-        
-        "leak_down": int(getattr(args, "leak_down", 4)),
-        "leak_noise": float(getattr(args, "leak_noise", 0.03)),
-
-        "sgs_leak_down": int(getattr(args, "sgs_leak_down", 0)),
-        "sgs_leak_noise": float(getattr(args, "sgs_leak_noise", -1.0)),
-        "sgs_leak_blur": float(getattr(args, "sgs_leak_blur", 0.0)),
-        "sgs_leak_qbits": int(getattr(args, "sgs_leak_qbits", 0)),
-        
-        "fault_w_coh":0.55,
-        "fault_w_ori":0.30,
-        "fault_w_edge":0.15,
-
-        "fault_thr":0.45,
-        "fault_k":12.0,
-
-        "fault_seed_thr":0.65,
-        "fault_band_sigma":3.5,
-        "fault_smooth_sigma":0.8,
-
-        "fault_leak_down":1,
-        "fault_leak_noise":0.01,
-
-        "edge_soft_k": 12.0,
-    }
-
+    edge_type, sgs_params, agc_params, det_params, cond_channels = _build_preproc_params(
+        args, device, amp
+    )
     layout = str(det_params.get("tex_layout", "sgs,agc,edge")).strip().lower()
     keys = [k.strip() for k in layout.split(",") if k.strip()]
-    cond_channels = len(keys)
 
     print(f"[cond] tex_layout={layout} -> keys={keys} -> cond_channels={cond_channels}")
 
@@ -3415,8 +3505,9 @@ def train(args):
                     xi = self._brightness_contrast(xi, self.brightness, self.contrast)
 
                 if random.random() < amp:
-                    tx = random.randint(-2, 2)
-                    ty = random.randint(-2, 2)
+                    shift_px = int(profile_cfg["ada_translation_px"])
+                    tx = random.randint(-shift_px, shift_px)
+                    ty = random.randint(-shift_px, shift_px)
                     xi = shift_pad_crop_chw(xi, dy=ty, dx=tx, pad_mode='reflect')
 
                 cH, cW = xi.shape[1], xi.shape[2]
@@ -3428,7 +3519,12 @@ def train(args):
             x01_aug = torch.stack(out, dim=0).to(x.device)
             return x01_aug * 2.0 - 1.0
 
-    ada_aug_geometric = ADAAug(max_rotate_deg=5, pad=20, brightness=0.0, contrast=0.0)
+    ada_aug_geometric = ADAAug(
+        max_rotate_deg=5,
+        pad=int(profile_cfg["ada_pad"]),
+        brightness=0.0,
+        contrast=0.0,
+    )
 
     ds = ImageFolderDataset(args.data_dir, crop_size=args.img_size)
     loader = DataLoader(ds, batch_size=args.batch, shuffle=True,
@@ -3460,7 +3556,9 @@ def train(args):
 
     D_base = PatchDiscriminator(in_channels=in_ch + cond_channels,
                            base_channels=128, n_layers=5, use_mbstd=True).to(device)
-    D_patch = MultiScaleDiscriminator(D_base, scales=(1.0, 0.5,0.25)).to(device)
+    D_patch = MultiScaleDiscriminator(
+        D_base, scales=tuple(profile_cfg["patch_scales"])
+    ).to(device)
     D_global = GlobalDiscriminator(in_channels=in_ch + cond_channels,
                                base_channels=128, n_layers=6, use_mbstd=True).to(device)
     D = CombinedDiscriminator(D_patch, D_global).to(device)
@@ -3480,20 +3578,41 @@ def train(args):
 
     fixed_z = torch.randn(8, args.z_dim, device=device)
 
-    eval_cond_num = 256  
-    rng = np.random.RandomState(args.seed + 123)
+    eval_cond_num = int(getattr(args, "eval_cond_num", 256))
+    train_eval_seed = int(getattr(args, "train_eval_seed", 42))
 
-    fixed_cond_imgs = []
-    for _ in range(eval_cond_num):
-        idx = int(rng.randint(0, len(ds)))
-        fixed_cond_imgs.append(ds[idx].unsqueeze(0))
-    fixed_cond_imgs = torch.cat(fixed_cond_imgs, dim=0).to(device)
+    py_state = random.getstate()
+    np_state = np.random.get_state()
 
-    with torch.no_grad():
-        fixed_cond_tex = compute_texture_maps_batch(
-            fixed_cond_imgs, sgs_params, agc_params, det_params,
-            device=device, edge_type=edge_type
-        )
+    try:
+        random.seed(train_eval_seed)
+        np.random.seed(train_eval_seed)
+
+        rng = np.random.RandomState(train_eval_seed + 123)
+
+        fixed_cond_imgs = []
+        for _ in range(eval_cond_num):
+            idx = int(rng.randint(0, len(ds)))
+            fixed_cond_imgs.append(ds[idx].unsqueeze(0))
+
+        fixed_cond_imgs = torch.cat(
+            fixed_cond_imgs,
+            dim=0
+        ).to(device)
+
+        with torch.no_grad():
+            fixed_cond_tex = compute_texture_maps_batch(
+                fixed_cond_imgs,
+                sgs_params,
+                agc_params,
+                det_params,
+                device=device,
+                edge_type=edge_type
+            )
+
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
     
     step = 0
 
@@ -3531,7 +3650,7 @@ def train(args):
             cond_tex = cond_augment_after_thr(cond_tex, args, allow_jitter=False)
             assert_finite_torch(cond_tex, "cond_tex", step)
 
-            real_phys = seismic_physics_aug(real_pair, p=phys_p)
+            real_phys = seismic_physics_aug(real_pair, p=phys_p, stable_gamma=bool(profile_cfg["stable_gamma"]))
 
             with torch.cuda.amp.autocast(enabled=amp):
                 z = torch.randn(batch_size, args.z_dim, device=device)
@@ -3541,7 +3660,7 @@ def train(args):
                          z2=z2).detach()
                 
                 assert_finite_torch(fake, "fake_raw", step)
-                fake_phys = seismic_physics_aug(fake, p=phys_p)
+                fake_phys = seismic_physics_aug(fake, p=phys_p, stable_gamma=bool(profile_cfg["stable_gamma"]))
                 assert_finite_torch(fake_phys, "fake_phys", step)
 
                 real_plus = torch.cat([real_phys, cond_tex], dim=1)
@@ -3616,7 +3735,7 @@ def train(args):
                          mixing_prob=args.style_mixing_prob,
                          z2=z2)
                 
-                fake_phys = seismic_physics_aug(fake, p=phys_p) 
+                fake_phys = seismic_physics_aug(fake, p=phys_p, stable_gamma=bool(profile_cfg["stable_gamma"])) 
 
                 fake_plus_for_g = torch.cat([fake_phys, cond_tex], dim=1)
                 fake_aug_for_g = ada_aug_geometric(fake_plus_for_g, augment_p)
@@ -4233,25 +4352,30 @@ def set_seed_all(seed: int):
     torch.backends.cudnn.benchmark = False
 
 def _build_preproc_params(args, device, amp: bool):
-    edge_type = getattr(args, "edge_type", "glog").strip().lower()
+    edge_type = getattr(args, "edge_type", "slog").strip().lower()
+    cfg = _profile_config(args)
+
+    def _value(name, default):
+        value = getattr(args, name, None)
+        return default if value is None else value
+
     sgs_params = {
-        "sigma": 1.5,
-        "anisotropy": 2.2,
+        "sigma": float(_value("sgs_sigma", cfg["sgs_sigma"])),
+        "anisotropy": float(_value("sgs_anisotropy", cfg["sgs_anisotropy"])),
         "iterations": 1,
         "base_kappa": 10.0,
-        "gamma": 0.06,
+        "gamma": float(_value("sgs_gamma", cfg["sgs_gamma"])),
         "device": device,
         "prefer_fp16": amp,
         "nl_h": 0.8,
     }
     agc_params = {
-        "window": 31,
+        "window": int(_value("agc_window", cfg["agc_window"])),
         "eps": 1e-8,
-        "p1": 1,
+        "p1": float(_value("agc_p1", cfg["agc_p1"])),
     }
     det_params = {
         "tex_layout": args.tex_layout,
-
         "glog_sigma": 0.4,
         "glog_anisotropy": 2.1,
         "glog_nangles": 8,
@@ -4260,12 +4384,10 @@ def _build_preproc_params(args, device, amp: bool):
         "glog_aniso_clip": 4.0,
         "glog_gamma_scale": 1.0,
         "glog_dist_mode": "relative",
-
         "log_sigma": 1.1,
         "canny_sigma": 1.7,
         "canny_low": 0.1,
         "canny_high": 0.9,
-
         "leak_down": int(getattr(args, "leak_down", 4)),
         "leak_noise": float(getattr(args, "leak_noise", 0.03)),
         "sgs_leak_down": int(getattr(args, "sgs_leak_down", 0)),
@@ -4274,22 +4396,20 @@ def _build_preproc_params(args, device, amp: bool):
         "sgs_leak_qbits": int(getattr(args, "sgs_leak_qbits", 0)),
         "fault_leak_down": int(getattr(args, "fault_leak_down", 1)),
         "fault_leak_noise": float(getattr(args, "fault_leak_noise", 0.01)),
-
-        "fault_w_coh": float(getattr(args, "fault_w_coh", 0.55)),
-        "fault_w_ori": float(getattr(args, "fault_w_ori", 0.30)),
-        "fault_w_edge": float(getattr(args, "fault_w_edge", 0.15)),
+        "fault_w_coh": float(_value("fault_w_coh", cfg["fault_w_coh"])),
+        "fault_w_ori": float(_value("fault_w_ori", cfg["fault_w_ori"])),
+        "fault_w_edge": float(_value("fault_w_edge", cfg["fault_w_edge"])),
         "fault_thr": float(getattr(args, "fault_thr", 0.45)),
         "fault_k": float(getattr(args, "fault_k", 12.0)),
         "fault_seed_thr": float(getattr(args, "fault_seed_thr", 0.65)),
         "fault_band_sigma": float(getattr(args, "fault_band_sigma", 3.5)),
         "fault_smooth_sigma": float(getattr(args, "fault_smooth_sigma", 0.8)),
-
         "edge_soft_k": 12.0,
-
         "ori_coh_tau": float(getattr(args, "ori_coh_tau", 0.35)),
+        "device": device,
     }
 
-    layout = str(det_params.get("tex_layout", "sgs,agc,edge")).strip().lower()
+    layout = str(det_params.get("tex_layout", "fault,agc,edge")).strip().lower()
     keys = [k.strip() for k in layout.split(",") if k.strip()]
     cond_channels = len(keys)
     return edge_type, sgs_params, agc_params, det_params, cond_channels
@@ -4343,33 +4463,43 @@ def _load_generator_from_ckpt(args, device, cond_channels, in_ch: int):
     return G
 
 @torch.no_grad()
-def evaluate_once(
+def prepare_test_condition_pool(
     args,
     device,
-    G: nn.Module,
     sgs_params,
     agc_params,
     det_params,
-    condition_edge_type: str,
-    evaluation_edge_type: str,
-    seed: int,
+    condition_edge_type,
 ):
+    ds = ImageFolderDataset(
+        args.data_dir,
+        crop_size=args.img_size
+    )
 
-    set_seed_all(seed)
+    eval_cond_num = int(
+        getattr(args, "eval_cond_num", 256)
+    )
 
-    ds = ImageFolderDataset(args.data_dir, crop_size=args.img_size)
+    base_seed = int(
+        getattr(args, "seed", 42)
+    )
 
-    eval_cond_num = int(getattr(args, "eval_cond_num", 256))
-
-    base_seed = int(getattr(args, "seed", seed))
     rng = np.random.RandomState(base_seed + 123)
 
+    # 保持原 evaluate_once 中生成 condition pool 时完全相同的随机状态
     set_seed_all(base_seed)
 
-    eval_pool_path = str(getattr(args, "eval_pool_path", "")).strip()
+    eval_pool_path = str(
+        getattr(args, "eval_pool_path", "")
+    ).strip()
 
     if eval_pool_path and os.path.isfile(eval_pool_path):
-        pool_obj = torch.load(eval_pool_path, map_location="cpu")
+
+        pool_obj = torch.load(
+            eval_pool_path,
+            map_location="cpu"
+        )
+
         if isinstance(pool_obj, dict):
             fixed_cond_imgs = pool_obj["real_crops"]
         else:
@@ -4377,22 +4507,39 @@ def evaluate_once(
 
         if fixed_cond_imgs.shape[0] != eval_cond_num:
             raise ValueError(
-                f"Saved evaluation pool contains {fixed_cond_imgs.shape[0]} crops, "
+                f"Saved evaluation pool contains "
+                f"{fixed_cond_imgs.shape[0]} crops, "
                 f"but eval_cond_num={eval_cond_num}."
             )
+
     else:
         fixed_cond_imgs = []
         selected_indices = []
 
         for _ in range(eval_cond_num):
-            idx = int(rng.randint(0, len(ds)))
-            selected_indices.append(idx)
-            fixed_cond_imgs.append(ds[idx].unsqueeze(0))
 
-        fixed_cond_imgs = torch.cat(fixed_cond_imgs, dim=0)
+            idx = int(
+                rng.randint(0, len(ds))
+            )
+
+            selected_indices.append(idx)
+
+            fixed_cond_imgs.append(
+                ds[idx].unsqueeze(0)
+            )
+
+        fixed_cond_imgs = torch.cat(
+            fixed_cond_imgs,
+            dim=0
+        )
 
         if eval_pool_path:
-            os.makedirs(os.path.dirname(eval_pool_path) or ".", exist_ok=True)
+
+            os.makedirs(
+                os.path.dirname(eval_pool_path) or ".",
+                exist_ok=True
+            )
+
             torch.save(
                 {
                     "real_crops": fixed_cond_imgs.cpu(),
@@ -4403,22 +4550,54 @@ def evaluate_once(
                 eval_pool_path,
             )
 
-    fixed_cond_imgs = fixed_cond_imgs.to(device, non_blocking=True)
+    fixed_cond_imgs = fixed_cond_imgs.to(
+        device,
+        non_blocking=True
+    )
 
-    with torch.no_grad():
-        fixed_cond_tex = compute_texture_maps_batch(
-            fixed_cond_imgs,
-            sgs_params=sgs_params,
-            agc_params=agc_params,
-            det_params=det_params,
-            device=device,
-            edge_type=condition_edge_type,
-        )
+    fixed_cond_tex = compute_texture_maps_batch(
+        fixed_cond_imgs,
+        sgs_params=sgs_params,
+        agc_params=agc_params,
+        det_params=det_params,
+        device=device,
+        edge_type=condition_edge_type,
+    )
+
+    return fixed_cond_imgs, fixed_cond_tex
+
+@torch.no_grad()
+def evaluate_once(
+    args,
+    device,
+    G: nn.Module,
+    sgs_params,
+    agc_params,
+    det_params,
+    condition_edge_type: str,
+    evaluation_edge_type: str,
+    seed: int,
+    fixed_cond_imgs: torch.Tensor,
+    fixed_cond_tex: torch.Tensor,
+    fixed_real_geo: np.ndarray,
+    fixed_real_phi: np.ndarray,
+):
 
     set_seed_all(seed)
 
-    n_need = int(getattr(args, "eval_n", 256))
-    z_dim  = int(getattr(args, "z_dim", 512))
+    eval_cond_num = int(fixed_cond_imgs.shape[0])
+
+    base_seed = int(
+        getattr(args, "seed", seed)
+    )
+
+    n_need = int(
+        getattr(args, "eval_n", 256)
+    )
+
+    z_dim = int(
+        getattr(args, "z_dim", 512)
+    )
 
     bs_eval = min(int(getattr(args, "batch", 8)), 16)
 
@@ -4436,6 +4615,7 @@ def evaluate_once(
         idx = torch.randint(0, eval_cond_num, (cur,), device=device)
         real = fixed_cond_imgs[idx]      # (cur,1,H,W)
         cond_tex = fixed_cond_tex[idx]   # (cur,C,H,W)
+        idx_np = idx.detach().cpu().numpy()
 
         z = torch.randn(cur, z_dim, device=device)
         fake = G(
@@ -4447,25 +4627,30 @@ def evaluate_once(
         all_real_imgs.append(real.detach().cpu())
         all_fake_imgs.append(fake.detach().cpu())
 
-        geo_r, geo_f = geo_features_batch(
-            real,
+        # real feature 直接从固定池缓存中索引
+        geo_r = fixed_real_geo[idx_np]
+        phi_r = fixed_real_phi[idx_np]
+
+        # 只有 fake 需要真正计算
+        geo_f = geo_features_only(
             fake,
             sgs_params,
             agc_params,
             det_params,
             edge_type=evaluation_edge_type,
         )
+
+        phi_f = phi_features_only(
+            fake,
+            sgs_params,
+            agc_params,
+            det_params,
+            edge_type=evaluation_edge_type,
+        )
+
         all_real_geo.append(geo_r)
         all_fake_geo.append(geo_f)
 
-        phi_r, phi_f = phi_features_batch(
-            real,
-            fake,
-            sgs_params,
-            agc_params,
-            det_params,
-            edge_type=evaluation_edge_type,
-        )
         all_phi_real.append(phi_r)
         all_phi_fake.append(phi_f)
 
@@ -5560,6 +5745,45 @@ def test(args):
     apply_g_bounds_(G, args)
     G.eval()
 
+    print("[test] Preparing fixed condition pool once...")
+
+    fixed_cond_imgs, fixed_cond_tex = prepare_test_condition_pool(
+        args=args,
+        device=device,
+        sgs_params=sgs_params,
+        agc_params=agc_params,
+        det_params=det_params,
+        condition_edge_type=condition_edge_type,
+    )
+    print("[test] Precomputing real GEO features...")
+
+    fixed_real_geo = geo_features_only(
+        fixed_cond_imgs,
+        sgs_params,
+        agc_params,
+        det_params,
+        edge_type=evaluation_edge_type,
+    )
+
+    print("[test] Precomputing real PHI features...")
+
+    fixed_real_phi = phi_features_only(
+        fixed_cond_imgs,
+        sgs_params,
+        agc_params,
+        det_params,
+        edge_type=evaluation_edge_type,
+    )
+
+    print(
+        f"[test] real GEO cache: {fixed_real_geo.shape}, "
+        f"real PHI cache: {fixed_real_phi.shape}"
+    )
+
+    print(
+        f"[test] Fixed condition pool ready: "
+        f"{tuple(fixed_cond_imgs.shape)}"
+    )
     # seeds
     if getattr(args, "seeds", ""):
         seeds = [int(x) for x in str(args.seeds).split(",") if str(x).strip()]
@@ -5583,6 +5807,10 @@ def test(args):
                 condition_edge_type=condition_edge_type,
                 evaluation_edge_type=evaluation_edge_type,
                 seed=run_seed,
+                fixed_cond_imgs=fixed_cond_imgs,
+                fixed_cond_tex=fixed_cond_tex,
+                fixed_real_geo=fixed_real_geo,
+                fixed_real_phi=fixed_real_phi,
             )
             runs.append(out)
             jlog.write(out)
@@ -6023,6 +6251,8 @@ def generate_downstream_dataset(args):
 # -------------------------
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", type=str, default="australian", choices=["australian", "f3"],
+                        help="survey-specific protocol defaults: australian or f3")
     parser.add_argument("--mode",type=str,required=True,choices=["train", "test", "generate", "diversity"],help="train, test, generate downstream dataset, or fixed-condition diversity analysis",)
     parser.add_argument("--diversity_n_conditions",type=int,default=20,help="number of fixed conditions used for diversity analysis",)
     parser.add_argument("--diversity_n_latents", type=int, default=50, help="number of latent samples generated for each fixed condition")
@@ -6032,31 +6262,31 @@ if __name__ == '__main__':
     parser.add_argument("--diversity_std_eps", type=float, default=1e-6, help="minimum real-reference standard deviation retained for diversity features")
     parser.add_argument("--fault_component_min_size", type=int, default=32, help="minimum connected-component size for the fault-likelihood geometry proxy")
 
-    parser.add_argument('--ckpt_path', type=str, default="", help='checkpoint path (.pth) for --mode test')
+    parser.add_argument('--ckpt_path', type=str, default='', help='checkpoint path (.pth) for test/generate/diversity')
     parser.add_argument('--seeds', type=str, default='43,44,45,46,47', help='comma-separated seeds for testing, e.g. 42,43,44,45,46')
     parser.add_argument('--repeats', type=int, default=30, help='how many repeats per seed (seed offseted)')
     parser.add_argument('--test_mixing_prob', type=float, default=0.0, help='style mixing prob during test (usually 0)')
     parser.add_argument('--save_test_images', default=True, help='save some real/fake grids per seed')
-    parser.add_argument('--device', type=str, default='cuda:0', help='torch device override, e.g. cuda:0 or cpu')
+    parser.add_argument('--device', type=str, default='', help='torch device override, e.g. cuda:0 or cpu; empty selects CUDA automatically')
     parser.add_argument("--label_dir",type=str,default="",help="paired fault-label directory for generation mode",)
     parser.add_argument("--generate_num",type=int,default=350,help="expected number of image-label pairs",)
     parser.add_argument("--generate_batch",type=int,default=8,help="batch size used only in generation mode",)
     parser.add_argument("--generate_seed",type=int,default=43000,help="base seed for deterministic per-image latent codes",)
     parser.add_argument("--overwrite_generate",action="store_true",help="delete and recreate a non-empty generation output directory",)
     parser.add_argument("--strict_generate_ckpt",action="store_true",help="stop if checkpoint keys do not exactly match generator",)
-    parser.add_argument('--data_dir', type=str, default="", help="path to training images")
-    parser.add_argument('--out_dir', type=str, default="")
+    parser.add_argument('--data_dir', type=str, required=True, help="path to training images")
+    parser.add_argument('--out_dir', type=str, required=True)
     parser.add_argument('--d_lr', type=float, default=5e-5)
     parser.add_argument('--g_lr', type=float, default=1e-4)
     parser.add_argument('--d_lr_decay_start', type=int, default=10000)
     parser.add_argument('--d_lr_decay_every', type=int, default=3000)
     parser.add_argument('--d_lr_decay_gamma', type=float, default=0.5)
     parser.add_argument('--d_lr_min', type=float, default=1e-6)
-    parser.add_argument('--img_size', type=int, default=512)
+    parser.add_argument('--img_size', type=int, default=None, help='override profile image size')
     parser.add_argument('--z_dim', type=int, default=512)
     parser.add_argument('--w_dim', type=int, default=512)
     parser.add_argument('--batch', type=int, default=16)
-    parser.add_argument('--epochs', type=int, default=1000)
+    parser.add_argument('--epochs', type=int, default=None, help='override profile epoch count')
     parser.add_argument('--gpus', type=int, default=1)
     parser.add_argument('--amp', action='store_true', help='use mixed precision')
     parser.add_argument('--log_interval', type=int, default=20)
@@ -6065,15 +6295,27 @@ if __name__ == '__main__':
     parser.add_argument('--eval_n', type=int, default=256)
     parser.add_argument('--eval_cond_num',type=int,default=256,help='number of fixed real crops in the shared evaluation condition pool',)
     parser.add_argument('--eval_edge_type',type=str,default='log',choices=['slog', 'glog', 'log', 'canny'],help='common edge operator used only for GEO and phi feature extraction',)
-    parser.add_argument('--eval_pool_path',type=str,default="",help='path used to save or load the shared real-crop evaluation pool',)
-    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--eval_pool_path',type=str,default='',help='path used to save or load the shared real-crop evaluation pool',)
+    parser.add_argument('--seed', type=int, default=35)
+    parser.add_argument('--train_eval_seed',type=int,default=42,help='fixed seed used only for the model-development evaluation pool')
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--style_mixing_prob', type=float, default=0.5,
                         help='probability of applying style-mixing per-sample during training (0..1). 0 disables mixing.')
-    parser.add_argument('--edge_type',type=str,default='glog',choices=['slog','glog', 'log', 'canny'],
+    parser.add_argument('--edge_type',type=str,default='slog',choices=['slog','glog', 'log', 'canny'],
                         help='edge / texture detector after nlmeans+SGS+AGC. glog applies cv2.normalize to suppress background.')
     parser.add_argument('--tex_layout', type=str, default='fault,agc,edge',
                         help="Comma-separated cond channels: edge,coherence,ori_sin,ori_cos,sgs,agc,hp,gray,fault. ")
+    # Optional preprocessing/conditioning overrides.  Leave unset to use the
+    # selected experiment profile exactly.
+    parser.add_argument('--sgs_sigma', type=float, default=None)
+    parser.add_argument('--sgs_anisotropy', type=float, default=None)
+    parser.add_argument('--sgs_gamma', type=float, default=None)
+    parser.add_argument('--agc_window', type=int, default=None)
+    parser.add_argument('--agc_p1', type=float, default=None)
+    parser.add_argument('--fault_w_coh', type=float, default=None)
+    parser.add_argument('--fault_w_ori', type=float, default=None)
+    parser.add_argument('--fault_w_edge', type=float, default=None)
+
 
     parser.add_argument('--leak_down', type=int, default=4,help='Downsample factor for leaky channels (sgs/agc/hp). 1 disables.')
     parser.add_argument('--leak_noise', type=float, default=0.03,help='Gaussian noise std added to leaky channels after down/up. 0 disables.')
@@ -6103,7 +6345,7 @@ if __name__ == '__main__':
     parser.add_argument('--cond_channel_drop_prob', type=float, default=0.10) 
     parser.add_argument('--cond_struct_pixel_dropout_rate', type=float, default=0.04)
     parser.add_argument('--cond_struct_block_prob', type=float, default=0.15)
-    parser.add_argument('--cond_struct_block_size', type=int, default=24)
+    parser.add_argument('--cond_struct_block_size', type=int, default=None)
 
     # density-aware pixel dropout on edge channel
     parser.add_argument('--edge_drop_base', type=float, default=0.01)   
@@ -6117,7 +6359,7 @@ if __name__ == '__main__':
 
     # block cutout (edge only)
     parser.add_argument('--edge_block_prob', type=float, default=0.3)
-    parser.add_argument('--edge_block_size', type=int, default=16)
+    parser.add_argument('--edge_block_size', type=int, default=None)
     parser.add_argument('--edge_block_num', type=int, default=2)
 
     # random downsample->upsample on edge (edge only)
@@ -6246,6 +6488,19 @@ if __name__ == '__main__':
 
     
     args = parser.parse_args()
+    args = _apply_profile_cli_defaults(args)
+
+    cfg = _profile_config(args)
+    print(
+        f"[profile] {args.profile} | img_size={args.img_size} | epochs={args.epochs} | "
+        f"edge_type={args.edge_type} | eval_edge_type={args.eval_edge_type}"
+    )
+    if args.profile == "f3":
+        print(
+            "[profile] F3 edge-independent defaults: "
+            f"fault_w_coh={cfg['fault_w_coh']}, "
+            f"fault_w_ori={cfg['fault_w_ori']}, fault_w_edge={cfg['fault_w_edge']}"
+        )
 
     if args.mode == "train":
         os.makedirs(args.out_dir, exist_ok=True)

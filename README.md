@@ -1,20 +1,22 @@
-# Condition-driven seismic synthesis with orientation-aware structural priors
+# Structural Conditioning for Source-Associated Seismic Resynthesis
 
 Official code and experiment repository for the manuscript:
 
-> **Condition-driven seismic synthesis with orientation-aware structural priors**  
+> **Structural Conditioning for Source-Associated Seismic Resynthesis: A Comparative Evaluation of Edge Detection Algorithms**  
 > Bensheng Yun, Xiaofeng Zhang, Yang Xiang, and Jie Shen  
 > Journal of Applied Geophysics submission, 2026
 
-This repository contains the main implementation, deterministic baselines, structural-prior characterization, downstream fault-segmentation experiment, and cleaned quantitative result files associated with the paper.
+This repository contains the implementation and paper-associated experiment code for comparing three structural priors—**SLoG**, **LoG**, and **Canny**—under matched conditional seismic-resynthesis pipelines.
+
+The proposed SLoG operator is the **structure-tensor-guided smoothing-based Laplacian of Gaussian (SLoG)** prior. The study treats the representation supplied to the conditional model as the main methodological question. StyleGAN2 with FiLM is used as a common synthesis backbone rather than as the principal contribution.
+
+> **Task framing.** The conditioning channels are extracted from corresponding observed seismic profiles. The experiments therefore evaluate **source-associated seismic resynthesis**, not unconstrained generation of independent geological realizations.
 
 ---
 
-## 1. Overview
+## 1. Main experimental design
 
-The study investigates **source-associated conditional seismic synthesis** rather than unconstrained generation of independent geological realizations.
-
-The main synthesis model is a StyleGAN2-inspired conditional generator using three source-derived channels:
+The principal conditional layout is:
 
 ```text
 fault + AGC + edge
@@ -22,84 +24,138 @@ fault + AGC + edge
 
 where:
 
-- `fault` is a label-free fault-likelihood prior derived from coherence reduction, local orientation change, and the selected structural edge response;
+- `fault` is a label-free fault-likelihood channel derived from coherence reduction, local orientation change, and, in the Australian pipeline, the selected structural edge response;
 - `AGC` is the automatic-gain-controlled seismic profile;
-- `edge` is one of the structural priors: **SLoG**, **LoG**, or **Canny**.
+- `edge` is one of SLoG, isotropic LoG, or binary Canny.
 
-The proposed **SLoG** prior is an orientation-aware continuous structural representation. It combines eight anisotropic Laplacian-of-Gaussian responses using local orientation, coherence, and diffusion-tensor anisotropy.
+Source-derived conditions are encoded at multiple scales and injected into the StyleGAN2-inspired generator through bounded residual FiLM modulation.
 
-The source-derived conditions are injected into the generator through a multi-scale condition encoder and bounded residual feature-wise linear modulation (FiLM).
+The repository also includes code for:
 
-The paper additionally uses:
-
-- deterministic **U-Net-L1** and **U-Net-Struct** baselines;
-- fixed-condition latent-sensitivity analysis;
+- three-training-seed Australian evaluation;
+- final `T=1000` real-real FD/RR evaluation;
+- late-window common-checkpoint ranking robustness;
 - 500-profile structural-prior characterization;
-- paired residual analysis;
-- synthetic-only transfer to a common real-data fault-segmentation test set.
-
-> **Important:** Because the condition channels are extracted from the corresponding source seismic profiles, the task is treated as **source-associated resynthesis**. The results should not be interpreted as independent geological realization generation.
-
----
-
-## 2. Main findings reproduced by the repository
-
-### 2.1 Matched StyleGAN2 comparison
-
-The three final `fault + AGC + edge` pipelines use matched channel roles, architecture, optimization settings, checkpoint-selection criterion, and a shared LoG-based output evaluator.
-
-| Prior | SWD | GEO KID | Total φ FD/RR | StructTex | Spectrum | Energy |
-|---|---:|---:|---:|---:|---:|---:|
-| SLoG | **0.1176 ± 0.0115** | **0.4849 ± 0.2880** | **0.9032 ± 0.0913** | **0.8139 ± 0.1912** | **0.3614 ± 0.0461** | 1.4195 ± 0.2219 |
-| LoG | 0.1182 ± 0.0117 | 2.9099 ± 0.4959 | 0.9511 ± 0.0873 | 2.9270 ± 0.7176 | 0.5221 ± 0.0687 | **1.0757 ± 0.1505** |
-| Canny | 0.1198 ± 0.0119 | 3.3957 ± 0.3891 | 1.4201 ± 0.1329 | 6.0575 ± 1.4350 | 1.2123 ± 0.1515 | 1.2112 ± 0.1723 |
-
-These values describe metric and latent resampling under the reported protocol and should not be interpreted as independent-training uncertainty.
-
-### 2.2 Deterministic baselines
-
-| Model | SWD | GEO KID | Total φ FD/RR | StructTex | Spectrum | Energy |
-|---|---:|---:|---:|---:|---:|---:|
-| U-Net-L1 | 0.1187 ± 0.0165 | 0.0919 ± 0.0352 | 0.6762 ± 0.0423 | 0.6120 ± 0.1351 | 0.0559 ± 0.0043 | 1.1012 ± 0.1374 |
-| U-Net-Struct | 0.1187 ± 0.0163 | **0.0836 ± 0.0326** | **0.5228 ± 0.0335** | **0.5289 ± 0.1236** | **0.0211 ± 0.0040** | **0.8527 ± 0.0946** |
-| StyleGAN2-SLoG | **0.1176 ± 0.0115** | 0.4849 ± 0.2880 | 0.9032 ± 0.0913 | 0.8139 ± 0.1912 | 0.3614 ± 0.0461 | 1.4195 ± 0.2219 |
-
-The deterministic baselines quantify how much source-associated agreement is directly recoverable from the same conditional tensor without a latent input or adversarial discriminator.
-
-### 2.3 Fixed-condition latent sensitivity
-
-For StyleGAN2-SLoG, with both the condition tensor and synthesis-noise realization held fixed:
-
-| Measure | Value |
-|---|---:|
-| Mean pixel variance | 4.1127 × 10⁻⁶ |
-| Mean pairwise LPIPS | 3.1337 × 10⁻⁴ |
-| Active-variance pixel fraction | 0.03836% |
-| GEO Structure within/between ratio | 8.1812 × 10⁻⁴ |
-| GEO Texture within/between ratio | 1.3305 × 10⁻³ |
-| φ StructTex within/between ratio | 1.3246 × 10⁻³ |
-| Fault-geometry within/between ratio | 1.6094 × 10⁻³ |
-
-The experiment isolates **latent-code sensitivity under fixed synthesis noise**. It does not measure variability caused by changing layer-wise synthesis-noise realizations.
+- deterministic U-Net controls;
+- fixed-condition latent-sensitivity analysis;
+- within-survey fault segmentation;
+- zero-shot Australian-to-CRACKS fault segmentation;
+- paired hierarchical-bootstrap and uncertain-fault sensitivity analysis;
+- an external F3 synthesis stress test using an edge-independent fault channel.
 
 ---
 
-## 3. Repository structure
+## 2. Main Australian results
+
+For each prior, three generators are trained independently using training seeds:
+
+```text
+35, 39, 42
+```
+
+Final evaluation uses:
+
+```text
+evaluation base seeds = 43, 44, 45, 46, 47
+repetitions per base seed = 30
+evaluation runs per trained generator = 150
+fixed evaluation conditions = 256
+shared evaluation edge = LoG
+final RR partitions T = 1000
+RR percentile = 95
+```
+
+Each trained generator is first summarized over its 150 matched evaluation runs. The values below are then reported as **mean ± sample standard deviation across the three independently trained generators (n=3)**.
+
+| Prior | SWD | GEO KID | Total phi FD/RR | StructTex | Spectrum | Energy |
+|---|---:|---:|---:|---:|---:|---:|
+| **SLoG** | **0.1176 ± 0.0001** | **0.5770 ± 0.2118** | **0.9150 ± 0.0848** | **1.0377 ± 0.4505** | **0.2552 ± 0.0847** | 1.4354 ± 0.1169 |
+| LoG | 0.1185 ± 0.0003 | 4.1668 ± 1.9808 | 1.0898 ± 0.1480 | 3.6926 ± 0.9721 | 0.5410 ± 0.0679 | 1.1735 ± 0.1422 |
+| Canny | 0.1202 ± 0.0005 | 5.5309 ± 2.7172 | 1.5245 ± 0.1934 | 8.3345 ± 3.0062 | 0.8986 ± 0.2979 | **1.0531 ± 0.0975** |
+
+The same total-phi-FD/RR ordering is retained at training seeds 35, 39, and 42. The result is not uniform across every attribute: SWD is close between SLoG and LoG, while the Energy subspace favors Canny at the model level.
+
+The raw final-test JSONL files used for this analysis are provided under:
+
+```text
+results/australian/
+```
+
+Each public JSONL should contain **150 unique evaluation runs**.
+
+---
+
+## 3. Late-window ranking robustness
+
+To test whether the cross-prior ordering is an artifact of prior-specific selected checkpoints, the paper also evaluates checkpoints shared by all nine Australian prior-seed runs.
+
+The manuscript analysis uses:
+
+```text
+10,000 to 20,500 optimization steps
+500-step interval
+22 common checkpoints
+3 priors × 3 training seeds
+```
+
+Across the 22 common checkpoints, SLoG has the lowest mean:
+
+- total phi FD/RR at 22/22 checkpoints;
+- GEO KID at 22/22 checkpoints;
+- StructTex FD/RR at 22/22 checkpoints;
+- Spectrum FD/RR at 22/22 checkpoints.
+
+Complementary measures are mixed: SWD is nearly split between SLoG and LoG, while Energy more often favors Canny.
+
+Run the analysis with:
+
+```bash
+python ranking_robustness.py \
+  --input /path/to/australian_training_logs_or_directory \
+  --out ./outputs/ranking_robustness \
+  --min-step 10000
+```
+
+The paper result is based on the 22 common checkpoints from 10,000 through 20,500 steps.
+
+---
+
+## 4. Repository structure
+
+Recommended public layout:
 
 ```text
 slog-seismic-profile-generation/
-├── .gitignore
-├── LICENSE
 ├── README.md
+├── LICENSE
 ├── requirements.txt
+├── .gitignore
 │
 ├── run_conditional_stylegan_experiment.py
 ├── slog_parameter_search.py
-├── unet_regression_baseline.py
 ├── seismic_edge_metrics.py
+├── unet_regression_baseline.py
 ├── downstream_fault_segmentation.py
 │
+├── final_rr_multiseed_analysis.py
+├── ranking_robustness.py
+├── plot_prior_support_characterization_500.py
+├── downstream_crosssurvey_unet.py
+├── analyze_crosssurvey_bootstrap_sensitivity.py
+│
 └── results/
+    ├── australian/
+    │   ├── multiseed_manifest.csv
+    │   ├── slog35.jsonl
+    │   ├── slog39.jsonl
+    │   ├── slog42.jsonl
+    │   ├── log35.jsonl
+    │   ├── log39.jsonl
+    │   ├── log42.jsonl
+    │   ├── canny35.jsonl
+    │   ├── canny39.jsonl
+    │   └── canny42.jsonl
+    │
     ├── stylegan_slog_summary.json
     ├── stylegan_log_summary.json
     ├── stylegan_canny_summary.json
@@ -113,68 +169,20 @@ slog-seismic-profile-generation/
     └── effective_parameters.json
 ```
 
-### `run_conditional_stylegan_experiment.py`
-
-Main implementation for:
-
-- conditional StyleGAN2 training;
-- checkpoint testing;
-- SLoG / LoG / Canny condition construction;
-- GEO and φ feature extraction;
-- FD/RR, GEO KID-style MMD², PRDC, and SWD evaluation;
-- synthetic-profile generation for downstream experiments;
-- fixed-condition latent-sensitivity analysis.
-
-### `slog_parameter_search.py`
-
-Parameter-search and preprocessing-analysis program used to examine SLoG and alternative structural-prior configurations.
-
-### `unet_regression_baseline.py`
-
-Deterministic condition-to-seismic U-Net implementation used for:
-
-- **U-Net-L1**;
-- **U-Net-Struct**;
-- paired reconstruction metrics;
-- shared GEO / φ / SWD distributional evaluation.
-
-### `seismic_edge_metrics.py`
-
-Structural-prior characterization used for the 500-profile SLoG / LoG / Canny comparison, including:
-
-- edge density;
-- directional continuity;
-- break rate;
-- fragmentation;
-- short-response ratio;
-- local orientation entropy;
-- low-coherence overlap and distance measures.
-
-### `downstream_fault_segmentation.py`
-
-Common U-Net fault-segmentation experiment for training on:
-
-- real profiles;
-- SLoG-conditioned synthetic profiles;
-- LoG-conditioned synthetic profiles;
-- Canny-conditioned synthetic profiles.
-
-The same initialization, real validation set, and real test set are used across the four training sources.
+The older cleaned result files may be retained because they document deterministic controls, latent diagnostics, and structural-prior characterization. The `results/australian/` directory contains the raw final three-training-seed Australian evaluation records used for the current main comparison.
 
 ---
 
-## 4. Environment
+## 5. Environment
 
-The paper experiments were implemented under:
+Paper experiments were implemented with:
 
 - Ubuntu 22.04 LTS
 - Python 3.9
 - PyTorch 1.12
 - NVIDIA RTX A6000, 48 GB VRAM
 
-The provided `requirements.txt` pins the PyTorch / torchvision versions to the CUDA 11.6 wheel combination corresponding to the paper environment and constrains the main scientific Python dependencies to compatible ranges.
-
-### Installation
+Install the repository dependencies with:
 
 ```bash
 git clone https://github.com/Xiaofeng-12/slog-seismic-profile-generation.git
@@ -187,7 +195,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-For Conda users:
+For Conda:
 
 ```bash
 conda create -n slog-seismic python=3.9 -y
@@ -195,157 +203,86 @@ conda activate slog-seismic
 pip install -r requirements.txt
 ```
 
-If CUDA 11.6 wheels are not appropriate for your machine, install a compatible PyTorch build separately and then install the remaining dependencies.
+If the PyTorch build specified in `requirements.txt` is not appropriate for the local CUDA environment, install a compatible PyTorch build first and then install the remaining dependencies.
 
 ---
 
-## 5. Dataset
+## 6. Datasets
 
-The experiments use the public interpreted seismic dataset released by:
+### 6.1 Australian seismic dataset
 
-> An et al. (2021), **A gigabyte interpreted seismic dataset for automatic fault recognition**, *Data in Brief*, 37, 107219.
+The main Australian experiments use the public dataset described by:
+
+> An et al. (2021), *A gigabyte interpreted seismic dataset for automatic fault recognition*, Data in Brief, 37, 107219.
 
 - Data article: https://doi.org/10.1016/j.dib.2021.107219
-- Dataset repository: https://doi.org/10.7910/DVN/YBYGBK
+- Dataset: https://doi.org/10.7910/DVN/YBYGBK
 
-The original seismic data are **not redistributed** in this repository.
+The original seismic data are not redistributed in this repository.
 
-### 5.1 Synthesis partition
+The synthesis preparation used in the paper is:
 
-The paper uses the following preparation protocol:
+1. Extract 1,603 two-dimensional profiles from the source volume.
+2. Randomly retain 1,200 profiles using **random seed 42**.
+3. Restore/order the retained profiles by source index.
+4. Select 400 profiles at regular index intervals for model development.
+5. Use the remaining 800 profiles as the within-volume evaluation partition.
 
-1. Two-dimensional seismic profiles are extracted from the original 3-D seismic volume.
-2. The extracted 3174 × 1537 planes are proportionally resampled to 2000 × 968 pixels.
-3. The extraction produces 1,603 two-dimensional profiles.
-4. A subset of 1,200 profiles is retained and ordered by source index.
-5. From the ordered subset:
-   - 400 profiles are sampled at regular index intervals for model development;
-   - the remaining 800 profiles form the within-volume evaluation partition.
+Because both partitions originate from the same 3-D volume, the Australian comparison is interpreted as **within-volume source-associated resynthesis**, not spatially independent or cross-survey generalization.
 
-Because the model-development and evaluation profiles originate from the same 3-D seismic volume, the reported synthesis results characterize **within-volume performance**, not generalization to an independent survey.
-
-### 5.2 Downstream fault-segmentation partition
-
-A separate labeled set contains 500 profile-mask pairs:
+A separate labeled set contains:
 
 ```text
-350 training
-50 validation
-100 real test
+350 training pairs
+50 validation pairs
+100 real test pairs
 ```
 
-The interpreted masks are **not** used to train or condition the seismic synthesis models.
+for the within-survey segmentation experiment.
 
-For the synthetic-only downstream experiment, each fixed StyleGAN2 checkpoint generates one synthetic profile for each of the 350 training-source profiles, and the generated profile is paired with the mask of its source profile.
+### 6.2 Netherlands F3 synthesis data
+
+The external synthesis stress test uses cropped real F3 seismic images prepared by the data source cited in the manuscript (Choi et al., 2025). These images are used as a label-free synthesis target.
+
+F3 synthesis uses three independent GAN training seeds:
+
+```text
+35, 39, 42
+```
+
+and the same fixed 25,000-step EMA checkpoint for every prior-seed run.
+
+### 6.3 CRACKS expert annotations
+
+The zero-shot downstream experiment uses the separately released CRACKS v2 expert annotations from the Netherlands North Sea F3 volume:
+
+- https://doi.org/10.5281/zenodo.13926822
+
+The expert subset used in the paper contains 40 matched seismic-section/mask pairs at native `255 × 701` geometry.
+
+Primary evaluation uses:
+
+```text
+class 3 = confident fault
+class 1 = confident non-fault
+classes 0 and 2 = ignored
+```
+
+A sensitivity analysis additionally treats class 2 as fault.
+
+No CRACKS image or expert label is used for Australian U-Net training, validation, threshold selection, early stopping, or parameter tuning.
 
 ---
 
-## 6. Preprocessing and condition construction
+## 7. Unified conditional StyleGAN2 program
 
-The principal preprocessing sequence is:
-
-```text
-grayscale
-  ↓
-non-local means denoising
-  ↓
-structure-guided smoothing (SGS)
-  ↓
-automatic gain control (AGC)
-  ↓
-structural-prior extraction
-```
-
-Each final crop is:
+The public implementation uses one main program:
 
 ```text
-512 × 512
+run_conditional_stylegan_experiment.py
 ```
 
-and is normalized to:
-
-```text
-[-1, 1]
-```
-
-The main three-channel layout is:
-
-```text
-fault,agc,edge
-```
-
-### Final preprocessing parameters
-
-| Parameter | Value |
-|---|---:|
-| NLMeans strength `h` | 0.8 |
-| SGS `sigma` | 1.5 |
-| SGS anisotropy | 2.2 |
-| SGS iterations | 1 |
-| SGS diffusion step `gamma` | 0.06 |
-| AGC window | 31 |
-| AGC lower percentile `p1` | 1.0 |
-
-### Structural-prior parameters
-
-| Prior | Settings |
-|---|---|
-| SLoG | `sigma=0.4`, `anisotropy=2.1`, `nangles=8`, `sharpness=14`, `alpha=0.92` |
-| LoG | `sigma=1.1` |
-| Canny | `sigma=1.7`, `low=0.1`, `high=0.9` |
-
-The complete parameter record used by the structural-prior characterization is provided in:
-
-```text
-results/effective_parameters.json
-```
-
-### Historical `glog` alias
-
-Some historical experiment outputs and command-line configurations use:
-
-```text
-glog
-```
-
-as the internal name for the proposed SLoG implementation.
-
-Therefore:
-
-```text
-glog == SLoG
-```
-
-in those historical records. New commands may use `slog` when supported by the current script.
-
----
-
-## 7. Structural-prior characterization
-
-Run:
-
-```bash
-python seismic_edge_metrics.py \
-  --input_dir /path/to/prior_characterization_profiles \
-  --output_dir ./outputs/edge_metrics \
-  --device cuda:0
-```
-
-The script produces per-profile and aggregated measurements for SLoG, LoG, and Canny.
-
-The cleaned paper-associated outputs are provided in:
-
-```text
-results/seismic_edge_metrics.csv
-results/algorithm_summary.csv
-results/effective_parameters.json
-```
-
-The analysis is intended to characterize structural-prior support and topology. Low-coherence overlap is used as a structural proxy and should not be interpreted as supervised fault-detection accuracy.
-
----
-
-## 8. Conditional StyleGAN2
+instead of maintaining separate near-duplicate Australian, F3, and final-test scripts.
 
 Display all options:
 
@@ -353,200 +290,236 @@ Display all options:
 python run_conditional_stylegan_experiment.py --help
 ```
 
-### 8.1 Train SLoG
+The program supports:
+
+```text
+--profile australian
+--profile f3
+```
+
+and:
+
+```text
+--mode train
+--mode test
+--mode generate
+--mode diversity
+```
+
+### 7.1 Australian profile
+
+The Australian profile reproduces the 512 × 512 within-volume protocol.
+
+Important profile defaults include:
+
+| Parameter | Australian |
+|---|---:|
+| Image size | 512 |
+| SGS sigma | 1.5 |
+| SGS anisotropy | 2.2 |
+| SGS gamma | 0.06 |
+| AGC window | 31 |
+| AGC p1 | 1 |
+| Fault coherence weight | 0.55 |
+| Fault orientation weight | 0.30 |
+| Fault edge weight | 0.15 |
+| Discriminator patch scales | 1.0, 0.5, 0.25 |
+
+Example SLoG training run:
 
 ```bash
 python run_conditional_stylegan_experiment.py \
+  --profile australian \
   --mode train \
-  --data_dir /path/to/train_400 \
-  --out_dir ./outputs/stylegan_slog \
+  --data_dir /path/to/development_400 \
+  --out_dir ./outputs/australian/slog_seed35 \
   --edge_type slog \
-  --tex_layout fault,agc,edge \
-  --img_size 512 \
+  --seed 35 \
   --batch 16 \
-  --seed 42 \
   --amp
 ```
 
-If the current script retains the historical name only, use:
+Repeat with training seeds 39 and 42, and replace `--edge_type` with `log` or `canny` for the alternative priors.
 
-```bash
---edge_type glog
-```
+### 7.2 F3 profile
 
-instead of `--edge_type slog`.
+The F3 profile reproduces the 128 × 128 external-survey synthesis stress-test protocol.
 
-### 8.2 Train LoG
+Important profile defaults include:
 
-```bash
-python run_conditional_stylegan_experiment.py \
-  --mode train \
-  --data_dir /path/to/train_400 \
-  --out_dir ./outputs/stylegan_log \
-  --edge_type log \
-  --tex_layout fault,agc,edge \
-  --img_size 512 \
-  --batch 16 \
-  --seed 42 \
-  --amp
-```
+| Parameter | F3 |
+|---|---:|
+| Image size | 128 |
+| SGS sigma | 2.5 |
+| SGS anisotropy | 2.5 |
+| SGS gamma | 0.04 |
+| AGC window | 11 |
+| AGC p1 | 3 |
+| Fault coherence weight | 0.6470588 |
+| Fault orientation weight | 0.3529412 |
+| **Fault edge weight** | **0.0** |
+| Discriminator patch scales | 1.0, 0.5 |
 
-### 8.3 Train Canny
+The zero edge weight is essential: fault and AGC conditions are identical across SLoG, LoG, and Canny in the F3 stress test, so only the direct structural-prior channel changes.
+
+Example:
 
 ```bash
 python run_conditional_stylegan_experiment.py \
+  --profile f3 \
   --mode train \
-  --data_dir /path/to/train_400 \
-  --out_dir ./outputs/stylegan_canny \
-  --edge_type canny \
-  --tex_layout fault,agc,edge \
-  --img_size 512 \
+  --data_dir /path/to/f3_train_images \
+  --out_dir ./outputs/f3/slog_seed35 \
+  --edge_type slog \
+  --seed 35 \
   --batch 16 \
-  --seed 42 \
   --amp
 ```
 
-The paper trains the synthesis models for 25,000 optimization steps with batch size 16 and uses EMA checkpoints for evaluation.
+Repeat for seeds 39 and 42 and for LoG/Canny.
 
 ---
 
-## 9. Shared-evaluator testing
+## 8. Final Australian testing
 
-The final SLoG / LoG / Canny comparison uses a **common LoG-based GEO / φ evaluator**.
+The final Australian comparison uses a shared LoG-based GEO/phi evaluator and a fixed 256-condition evaluation pool.
 
-This is important:
-
-```text
-condition edge type != evaluation edge type
-```
-
-For example, SLoG testing uses:
-
-```text
-condition edge: SLoG
-evaluation edge: LoG
-```
-
-### Example: SLoG
+Example:
 
 ```bash
 python run_conditional_stylegan_experiment.py \
+  --profile australian \
   --mode test \
   --data_dir /path/to/evaluation_800 \
-  --out_dir ./outputs/test_slog \
-  --ckpt_path ./checkpoints/slog_best_total_step17500.pth \
-  --device cuda:0 \
-  --edge_type slog \
-  --eval_edge_type log \
-  --tex_layout fault,agc,edge \
-  --img_size 512 \
-  --seeds 43,44,45,46,47 \
-  --repeats 3 \
-  --test_mixing_prob 0.0 \
-  --eval_n 256 \
-  --kid_subsets 20 \
-  --prdc_ks 3 \
-  --prdc_boot 200 \
-  --rr_fd_trials 20 \
-  --rr_fd_percentile 95
-```
-
-Use the corresponding edge type and checkpoint for LoG and Canny.
-
-### Selected StyleGAN2 checkpoints
-
-| Prior | Selected step |
-|---|---:|
-| SLoG | 17,500 |
-| LoG | 23,500 |
-| Canny | 24,500 |
-
-When a checkpoint contains both `G_ema` and `G`, testing should use `G_ema`.
-
----
-
-## 10. Deterministic U-Net baselines
-
-The deterministic U-Net reuses the same condition-construction and shared-evaluation implementation from:
-
-```text
-run_conditional_stylegan_experiment.py
-```
-
-### 10.1 U-Net-L1
-
-```bash
-python unet_regression_baseline.py \
-  --mode train \
-  --source_code ./run_conditional_stylegan_experiment.py \
-  --data_dir /path/to/train_400 \
-  --out_dir ./outputs/unet_l1 \
-  --edge_type slog \
-  --eval_edge_type log \
-  --tex_layout fault,agc,edge \
-  --max_steps 25000 \
-  --lambda_l1 1.0 \
-  --lambda_spec 0 \
-  --lambda_grad 0 \
-  --lambda_grad_dir 0 \
-  --lambda_st_ori 0 \
-  --amp
-```
-
-### 10.2 U-Net-Struct
-
-```bash
-python unet_regression_baseline.py \
-  --mode train \
-  --source_code ./run_conditional_stylegan_experiment.py \
-  --data_dir /path/to/train_400 \
-  --out_dir ./outputs/unet_struct \
-  --edge_type slog \
-  --eval_edge_type log \
-  --tex_layout fault,agc,edge \
-  --max_steps 25000 \
-  --lambda_l1 1.0 \
-  --lambda_spec 0.15 \
-  --lambda_grad 0.20 \
-  --lambda_grad_dir 0.03 \
-  --lambda_st_ori 0.02 \
-  --amp
-```
-
-### 10.3 U-Net testing
-
-```bash
-python unet_regression_baseline.py \
-  --mode test \
-  --source_code ./run_conditional_stylegan_experiment.py \
-  --ckpt_path ./checkpoints/unet_struct_ema_step25000.pth \
+  --out_dir ./outputs/final_test/slog_seed35 \
+  --ckpt_path /path/to/selected_slog_seed35_checkpoint.pth \
   --eval_pool_path /path/to/fixed_test_pool_256.pt \
-  --out_dir ./outputs/unet_struct_test \
   --edge_type slog \
   --eval_edge_type log \
-  --tex_layout fault,agc,edge \
   --seeds 43,44,45,46,47 \
-  --repeats 3
+  --repeats 30 \
+  --eval_n 256 \
+  --eval_cond_num 256 \
+  --rr_fd_trials 1000 \
+  --rr_fd_percentile 95 \
+  --test_mixing_prob 0.0 \
+  --device cuda:0
 ```
 
-Paper-associated cleaned result files:
+Important distinctions:
 
-```text
-results/unet_l1_summary.json
-results/unet_struct_summary.json
-results/unet_l1_paired_metrics.json
-results/unet_struct_paired_metrics.json
-```
+- training seed and evaluation seed are different concepts;
+- training seeds are 35, 39, and 42;
+- evaluation base seeds are 43–47;
+- each base seed is repeated 30 times;
+- the final Australian comparison uses `T=1000` RR partitions;
+- development/checkpoint-screening evaluations retain the lower-cost `T=20` protocol unless otherwise specified;
+- evaluation uses EMA generator weights when available.
 
 ---
 
-## 11. Fixed-condition latent-sensitivity analysis
+## 9. Reproduce the Australian multi-seed summary
 
-The reported SLoG latent experiment uses:
+The nine raw final-test files are mapped by:
 
 ```text
-20 fixed conditions
-50 latent codes per condition
+results/australian/multiseed_manifest.csv
+```
+
+Run from the **repository root**:
+
+```bash
+python final_rr_multiseed_analysis.py \
+  --manifest results/australian/multiseed_manifest.csv \
+  --out_dir results/australian/summary \
+  --hier_boot 10000
+```
+
+The manifest records:
+
+```text
+3 priors × 3 independent training seeds
+rr_trials = 1000
+```
+
+Expected raw files:
+
+```text
+results/australian/slog35.jsonl
+results/australian/slog39.jsonl
+results/australian/slog42.jsonl
+results/australian/log35.jsonl
+results/australian/log39.jsonl
+results/australian/log42.jsonl
+results/australian/canny35.jsonl
+results/australian/canny39.jsonl
+results/australian/canny42.jsonl
+```
+
+Each JSONL should contain 150 unique matched evaluation runs.
+
+The analysis script produces model-level and seed-level summaries together with paired hierarchical-bootstrap results.
+
+---
+
+## 10. Structural-prior characterization
+
+The 500-profile characterization compares response support and topology for SLoG, LoG, and Canny.
+
+Existing structural metrics are produced with:
+
+```text
+seismic_edge_metrics.py
+```
+
+The additional paper figure is generated with:
+
+```bash
+python plot_prior_support_characterization_500.py \
+  --metrics_csv results/seismic_edge_metrics.csv \
+  --params_json results/effective_parameters.json \
+  --image_dir /path/to/the_same_500_profiles \
+  --out_dir ./outputs/prior_support
+```
+
+The analysis includes:
+
+- response-value distributions;
+- threshold-survival support curves;
+- valid-signal response density;
+- fragmentation.
+
+These measurements characterize representation support and topology. They are not supervised fault-detection accuracy measures.
+
+---
+
+## 11. Deterministic controls and latent sensitivity
+
+### Deterministic U-Net controls
+
+The existing:
+
+```text
+unet_regression_baseline.py
+```
+
+implements U-Net-L1 and U-Net-Struct controls using the same source-derived condition tensor and shared seismic evaluator.
+
+These controls show how much source-associated agreement is recoverable deterministically from the condition tensor without a latent code or adversarial discriminator.
+
+### Fixed-condition latent sensitivity
+
+The unified main program includes:
+
+```text
+--mode diversity
+```
+
+The reported experiment uses:
+
+```text
+20 fixed SLoG conditions
+50 shared latent codes per condition
 latent seed = 46000
 fixed synthesis-noise seed = 2026
 ```
@@ -555,30 +528,33 @@ Example:
 
 ```bash
 python run_conditional_stylegan_experiment.py \
+  --profile australian \
   --mode diversity \
-  --ckpt_path ./checkpoints/slog_best_total_step17500.pth \
-  --eval_pool_path /path/to/fixed_test_pool_256.pt \
+  --data_dir /path/to/evaluation_data \
   --out_dir ./outputs/latent_sensitivity \
+  --ckpt_path /path/to/slog_checkpoint.pth \
+  --eval_pool_path /path/to/fixed_test_pool_256.pt \
   --edge_type slog \
   --eval_edge_type log \
-  --tex_layout fault,agc,edge \
   --diversity_n_conditions 20 \
   --diversity_n_latents 50 \
   --diversity_seed 46000 \
   --diversity_noise_seed 2026
 ```
 
-The cleaned result is provided in:
-
-```text
-results/stylegan_slog_latent_sensitivity.json
-```
+The experiment holds the condition tensor and synthesis-noise realization fixed and therefore isolates latent-code sensitivity.
 
 ---
 
-## 12. Downstream fault segmentation
+## 12. Within-survey fault segmentation
 
-The downstream experiment compares four training sources:
+The existing:
+
+```text
+downstream_fault_segmentation.py
+```
+
+compares four training sources:
 
 ```text
 real
@@ -587,160 +563,211 @@ LoG synthetic
 Canny synthetic
 ```
 
-with the same segmentation architecture, initialization, augmentation, optimization procedure, real validation set, and real test set.
+All four use the same segmentation architecture, initialization, augmentation, optimizer, validation set, and real test set.
 
-Example:
+The paper treats this as a controlled application-level information-retention test rather than evidence that one prior universally improves segmentation.
+
+---
+
+## 13. Zero-shot Australian-to-CRACKS evaluation
+
+The external downstream experiment is implemented by:
+
+```text
+downstream_crosssurvey_unet.py
+```
+
+For each training seed 35, 39, and 42, the four U-Nets are trained using Australian data and selected only with the Australian validation set. CRACKS is used only for final testing.
+
+Example structure:
 
 ```bash
-python downstream_fault_segmentation.py \
-  --experiments real,slog,log,canny \
-  --output_root ./outputs/downstream \
+python downstream_crosssurvey_unet.py \
+  --seed 35 \
+  --output_root ./outputs/cracks/seed35 \
   --device cuda:0 \
   --real_train_images /path/to/real/train/images \
   --real_train_labels /path/to/real/train/labels \
   --real_val_images /path/to/real/val/images \
   --real_val_labels /path/to/real/val/labels \
-  --real_test_images /path/to/real/test/images \
-  --real_test_labels /path/to/real/test/labels \
-  --slog_train_images /path/to/slog/images \
-  --slog_train_labels /path/to/slog/labels \
-  --log_train_images /path/to/log/images \
-  --log_train_labels /path/to/log/labels \
-  --canny_train_images /path/to/canny/images \
-  --canny_train_labels /path/to/canny/labels \
+  --real_test_images /path/to/cracks/images \
+  --real_test_labels /path/to/cracks/expert_masks \
+  --slog_train_images /path/to/slog/train/images \
+  --slog_train_labels /path/to/slog/train/labels \
+  --log_train_images /path/to/log/train/images \
+  --log_train_labels /path/to/log/train/labels \
+  --canny_train_images /path/to/canny/train/images \
+  --canny_train_labels /path/to/canny/train/labels \
   --expected_train_count 350 \
   --expected_val_count 50 \
-  --expected_test_count 100 \
+  --expected_test_count 40 \
   --epochs 100 \
+  --threshold 0.5 \
+  --tolerance_radius 3 \
   --amp
 ```
 
-The manuscript reports the following single-run real-test Dice/F1 values:
+Repeat for seeds 39 and 42.
+
+Primary CRACKS results reported in the manuscript are:
 
 | Training source | Dice/F1 | IoU | Precision | Recall | Tolerant F1 |
 |---|---:|---:|---:|---:|---:|
-| Real | 0.5129 | 0.3449 | 0.4604 | 0.5787 | 0.7261 |
-| SLoG synthetic | 0.5198 | 0.3511 | 0.4500 | 0.6152 | 0.7281 |
-| LoG synthetic | 0.5200 | 0.3514 | 0.4392 | 0.6374 | 0.7262 |
-| Canny synthetic | 0.4883 | 0.3231 | 0.4133 | 0.5966 | 0.6950 |
+| Real | 0.0954 ± 0.0139 | 0.0501 ± 0.0076 | 0.0907 ± 0.0196 | 0.1049 ± 0.0273 | 0.1184 ± 0.0152 |
+| **SLoG** | **0.1504 ± 0.0269** | **0.0814 ± 0.0157** | **0.1468 ± 0.0308** | 0.1554 ± 0.0265 | **0.1833 ± 0.0357** |
+| LoG | 0.1461 ± 0.0396 | 0.0791 ± 0.0233 | 0.1056 ± 0.0353 | **0.2508 ± 0.0513** | 0.1630 ± 0.0458 |
+| Canny | 0.1492 ± 0.0139 | 0.0806 ± 0.0081 | 0.1117 ± 0.0082 | 0.2279 ± 0.0427 | 0.1689 ± 0.0131 |
 
-These results are an application-level information-retention check. They do **not** establish a statistically significant segmentation advantage of SLoG over LoG.
+These results show a precision-recall trade-off rather than a universal SLoG advantage.
 
 ---
 
-## 13. Evaluation spaces and metrics
+## 14. CRACKS bootstrap and uncertain-label sensitivity
 
-### GEO feature space
-
-The GEO representation contains 28 domain-oriented attributes emphasizing interpretable structure and texture.
-
-### φ feature space
-
-The φ representation contains 160 dimensions:
+Post-hoc paired analysis is implemented by:
 
 ```text
-StructTex: 32
-Spectrum:  64
-Energy:    64
+analyze_crosssurvey_bootstrap_sensitivity.py
+```
+
+It reloads the saved U-Net checkpoints and evaluates:
+
+1. the primary confident-label definition;
+2. an inclusive definition in which uncertain class-2 pixels are treated as faults.
+
+It also supports hierarchical paired bootstrap across training runs and matched CRACKS sections.
+
+Example:
+
+```bash
+python analyze_crosssurvey_bootstrap_sensitivity.py \
+  --base_code ./downstream_crosssurvey_unet.py \
+  --run_dirs ./outputs/cracks/seed35,./outputs/cracks/seed39,./outputs/cracks/seed42 \
+  --f3_images /path/to/cracks/images \
+  --f3_labels /path/to/cracks/expert_masks \
+  --bootstrap_n 10000 \
+  --output_dir ./outputs/cracks/bootstrap
+```
+
+---
+
+## 15. External F3 synthesis stress test
+
+The F3 synthesis experiment uses the same unified StyleGAN2 code with:
+
+```text
+--profile f3
+```
+
+The common 25,000-step EMA checkpoint is evaluated for every prior-seed run.
+
+Final model-level results are:
+
+| Prior | SWD | GEO MMD | GEO W | phi FD | phi FD/RR | phi KID |
+|---|---:|---:|---:|---:|---:|---:|
+| **SLoG** | **0.1080 ± 0.0064** | **0.3036 ± 0.0253** | **1.0413 ± 0.0669** | **96.11 ± 5.70** | **2.5779 ± 0.1990** | **1.8279 ± 0.2245** |
+| LoG | 0.1091 ± 0.0066 | 0.6292 ± 0.0303 | 1.6144 ± 0.0960 | 323.84 ± 12.18 | 8.6844 ± 0.5036 | 20.3779 ± 1.7458 |
+| Canny | 0.1146 ± 0.0070 | 0.6668 ± 0.0193 | 2.1333 ± 0.0949 | 506.69 ± 17.00 | 13.5909 ± 0.8071 | 54.6218 ± 4.8891 |
+
+The F3 images used for synthesis evaluation are label-free. This experiment therefore evaluates external-survey synthesis-distribution behavior rather than fault-detection accuracy or zero-shot generator generalization.
+
+---
+
+## 16. Evaluation spaces and terminology
+
+### GEO
+
+The GEO representation contains 28 domain-oriented attributes emphasizing seismic structure and texture.
+
+### phi
+
+The phi representation contains 160 dimensions:
+
+```text
+StructTex = 32
+Spectrum  = 64
+Energy    = 64
 ```
 
 ### FD/RR
 
-FD/RR is a feature-space-specific normalized Fréchet-distance measure using a real-real reference distribution.
-
-Lower values indicate closer agreement in the specified feature space.
-
-FD/RR should **not** be interpreted as an absolute measure of geological validity.
-
-### KID terminology
-
-The repository reports a KID-style unbiased polynomial-kernel MMD² estimator in domain-specific feature spaces.
-
-It is **not** ImageNet Inception KID.
-
-### FID terminology
-
-The reported FD values are computed from domain-specific seismic features and should **not** be interpreted as ImageNet FID.
-
----
-
-## 14. Results directory
-
-The cleaned files under `results/` provide the numerical values used in the manuscript.
-
-| File | Content |
-|---|---|
-| `stylegan_slog_summary.json` | Final SLoG shared-evaluator results |
-| `stylegan_log_summary.json` | Final LoG shared-evaluator results |
-| `stylegan_canny_summary.json` | Final Canny shared-evaluator results |
-| `unet_l1_summary.json` | U-Net-L1 distributional evaluation |
-| `unet_struct_summary.json` | U-Net-Struct distributional evaluation |
-| `unet_l1_paired_metrics.json` | U-Net-L1 paired reconstruction metrics |
-| `unet_struct_paired_metrics.json` | U-Net-Struct paired reconstruction metrics |
-| `stylegan_slog_latent_sensitivity.json` | Fixed-condition SLoG latent-sensitivity analysis |
-| `algorithm_summary.csv` | Aggregated 500-profile structural-prior statistics |
-| `seismic_edge_metrics.csv` | Per-profile structural-prior measurements |
-| `effective_parameters.json` | Final preprocessing / prior parameters |
-
-The cleaned public result files omit local workstation paths and other environment-specific metadata.
-
----
-
-## 15. Pretrained checkpoints
-
-Paper-associated checkpoints are distributed through:
-
-https://github.com/Xiaofeng-12/slog-seismic-profile-generation/releases
-
-Place downloaded checkpoints under:
+FD/RR is the domain-feature Fréchet distance between real and generated samples normalized by a real-real reference:
 
 ```text
-checkpoints/
+FD(real, generated) / Q95[FD(real subset 1, real subset 2)]
 ```
 
-The deterministic U-Net release assets use the following names:
+Lower values indicate smaller discrepancy relative to the real-real reference.
+
+### Important terminology
+
+- **FD is not ImageNet FID.**
+- The reported **GEO KID** is a KID-style unbiased polynomial-kernel MMD² estimator in domain-specific seismic features; it is not ImageNet Inception KID.
+- GEO and phi are internally defined diagnostic spaces used to compare the matched experiments and are not universal seismic-quality scales.
+
+---
+
+## 17. Historical `glog` alias
+
+Some historical files use:
 
 ```text
-unet_l1_ema_step25000.pth
-unet_struct_ema_step25000.pth
+glog
 ```
 
-The selected StyleGAN2 checkpoints correspond to steps 17,500, 23,500, and 24,500 for SLoG, LoG, and Canny, respectively.
+as the internal name for SLoG.
 
-If the release contains renamed public inference checkpoints, use the exact release asset names in the `--ckpt_path` argument.
+For those records:
 
----
+```text
+glog == SLoG
+```
 
-## 16. Reproducibility notes
-
-- GAN training is stochastic.
-- Numerical values may vary slightly across GPU architectures, CUDA versions, drivers, and library builds.
-- Final synthesis comparisons should use the same shared LoG-based output evaluator.
-- The final 256-profile comparison pool should not be used for checkpoint selection.
-- U-Net evaluation should use EMA weights.
-- Historical result files may use `glog` as an alias for SLoG.
-- The fixed-condition latent experiment holds the synthesis-noise realization constant and therefore isolates latent-code sensitivity only.
-- Downstream segmentation values in the paper are from one fixed training run per training source.
+The current unified main program accepts both `slog` and the historical `glog` alias.
 
 ---
 
-## 17. Data and code availability
+## 18. Reproducibility notes
 
-The seismic dataset is publicly available from Harvard Dataverse:
-
-https://doi.org/10.7910/DVN/YBYGBK
-
-The source code, experiment implementation, cleaned result files, and paper-associated checkpoints are provided in this repository and its Releases page.
+- GAN training is stochastic; training seeds are explicitly reported.
+- The final Australian model-level uncertainty is calculated across three independent GAN training seeds, not across individual evaluation resamples.
+- The 256-profile final Australian evaluation pool is separate from the model-development pool and should not be used for checkpoint selection.
+- Development/checkpoint-screening RR evaluation normally uses `T=20`; the final Australian comparison uses `T=1000`.
+- All cross-prior final output comparisons use the same LoG-based GEO/phi evaluator.
+- When a checkpoint contains both `G_ema` and `G`, evaluation uses EMA weights.
+- The Australian 400/800 partitions come from the same 3-D volume and may contain spatially adjacent sections.
+- The F3 synthesis stress test is label-free.
+- CRACKS contains 40 expert-annotated sections and is used only as an external downstream test set.
+- Numerical values may vary slightly across GPU architectures, CUDA versions, and library builds.
 
 ---
 
-## 18. Citation
+## 19. Data and code availability
 
-If you use this code or the associated results, please cite the manuscript:
+Australian seismic data:
+
+- https://doi.org/10.7910/DVN/YBYGBK
+
+CRACKS v2:
+
+- https://doi.org/10.5281/zenodo.13926822
+
+Repository:
+
+- https://github.com/Xiaofeng-12/slog-seismic-profile-generation
+
+The source seismic datasets and CRACKS annotations are not redistributed in this repository.
+
+---
+
+## 20. Citation
+
+If you use this repository, please cite the associated manuscript:
 
 ```bibtex
-@article{Yun2026ConditionDrivenSeismic,
-  title   = {Condition-driven seismic synthesis with orientation-aware structural priors},
+@article{Yun2026StructuralConditioning,
+  title   = {Structural Conditioning for Source-Associated Seismic Resynthesis:
+             A Comparative Evaluation of Edge Detection Algorithms},
   author  = {Yun, Bensheng and Zhang, Xiaofeng and Xiang, Yang and Shen, Jie},
   journal = {Journal of Applied Geophysics},
   year    = {2026},
@@ -748,19 +775,19 @@ If you use this code or the associated results, please cite the manuscript:
 }
 ```
 
-The BibTeX entry should be updated after publication with the final volume, pages/article number, and DOI.
+Update the BibTeX entry with the final DOI, volume, and article number after publication.
 
 ---
 
-## 19. License
+## 21. License
 
 This repository is released under the MIT License.
 
-The original seismic dataset and third-party software remain subject to their respective licenses and terms of use.
+The original seismic datasets and third-party software remain subject to their respective licenses and terms of use.
 
 ---
 
-## 20. Contact
+## 22. Contact
 
 **Bensheng Yun**  
 Zhejiang University of Science and Technology  
