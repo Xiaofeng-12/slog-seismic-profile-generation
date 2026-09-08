@@ -1,0 +1,10 @@
+prior,training_seed,jsonl,rr_trials
+SLoG,35,results/australian/slog35.jsonl,1000
+SLoG,39,results/australian/slog39.jsonl,1000
+SLoG,42,results/australian/slog42.jsonl,1000
+LoG,35,results/australian/log35.jsonl,1000
+LoG,39,results/australian/log39.jsonl,1000
+LoG,42,results/australian/log42.jsonl,1000
+Canny,35,results/australian/canny35.jsonl,1000
+Canny,39,results/australian/canny39.jsonl,1000
+Canny,42,results/australian/canny42.jsonl,1000
