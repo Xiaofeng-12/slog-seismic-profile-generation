@@ -515,6 +515,7 @@ A generic test command is:
 
 ```bash
 python run_conditional_stylegan_experiment.py \
+  --profile australian \
   --mode test \
   --data_dir /path/to/evaluation_800 \
   --out_dir ./outputs/test_slog_seed35 \
@@ -527,8 +528,12 @@ python run_conditional_stylegan_experiment.py \
   --seeds 43,44,45,46,47 \
   --repeats 30 \
   --test_mixing_prob 0.0 \
-  --eval_n 256
+  --eval_n 256 \
+  --rr_fd_trials 1000 \
+  --rr_fd_percentile 95
 ```
+
+For the final Australian results reported in the manuscript, `--rr_fd_trials 1000` and `--rr_fd_percentile 95` must be retained. The default `rr_fd_trials` value in the main script is intended for faster exploratory evaluation and does not reproduce the final FD/RR reference estimation used in the paper.
 
 The final paper treats the three independently trained generators (`35`, `39`, `42`) as the model-level independent units. Repeated metric/latent evaluation within one trained generator is **not** reported as independent-training uncertainty.
 
