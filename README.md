@@ -233,33 +233,83 @@ slog-seismic-profile-generation/
 ├── requirements.txt
 │
 ├── run_conditional_stylegan_experiment.py
+├── final_rr_multiseed_analysis.py
+├── ranking_robustness.py
 ├── slog_parameter_search.py
-├── unet_regression_baseline.py
+├── plot_prior_support_characterization_500.py
 ├── seismic_edge_metrics.py
+├── unet_regression_baseline.py
 ├── downstream_fault_segmentation.py
+├── downstream_crosssurvey_unet.py
+├── analyze_crosssurvey_bootstrap_sensitivity.py
 │
 └── results/
+    ├── multiseed_manifest.csv
+    │
+    ├── slog35.jsonl
+    ├── slog39.jsonl
+    ├── slog42.jsonl
+    ├── log35.jsonl
+    ├── log39.jsonl
+    ├── log42.jsonl
+    ├── canny35.jsonl
+    ├── canny39.jsonl
+    ├── canny42.jsonl
+    │
+    ├── slog_test_runs.jsonl
+    ├── log_test_runs.jsonl
+    ├── canny_test_runs.jsonl
+    ├── slog_test_summary_strict.json
+    ├── log_test_summary.json
+    ├── canny_test_summary.json
+    │
     ├── stylegan_slog_summary.json
     ├── stylegan_log_summary.json
     ├── stylegan_canny_summary.json
+    │
     ├── unet_l1_summary.json
     ├── unet_struct_summary.json
-    ├── unet_l1_paired_metrics.json
-    ├── unet_struct_paired_metrics.json
-    ├── stylegan_slog_latent_sensitivity.json
+    │
     ├── algorithm_summary.csv
     ├── seismic_edge_metrics.csv
-    ├── effective_parameters.json
-    └── seed-specific SLoG / LoG / Canny result files
+    └── effective_parameters.json
 ```
 
-The final repository snapshot should retain the seed-specific result files for training seeds 35, 39, and 42 because the manuscript treats the **trained generator**, rather than metric resampling alone, as the model-level independent unit.
+The nine files
 
-Historical files may use `glog` as the internal alias for SLoG:
+```text
+slog35.jsonl
+slog39.jsonl
+slog42.jsonl
+log35.jsonl
+log39.jsonl
+log42.jsonl
+canny35.jsonl
+canny39.jsonl
+canny42.jsonl
+```
+
+contain the final Australian evaluation outputs for three independently trained generators per structural prior. Each file contains 150 matched evaluation runs used to construct the final seed-level and model-level statistics reported in the manuscript.
+
+`multiseed_manifest.csv` provides the mapping between structural prior, GAN training seed, JSONL result file, and the number of real-real FD reference trials used for the final analysis.
+
+The files
+
+```text
+stylegan_slog_summary.json
+stylegan_log_summary.json
+stylegan_canny_summary.json
+```
+
+and the corresponding `*_test_runs.jsonl` / `*_test_summary*.json` files contain earlier or auxiliary single-generator evaluation summaries. They are retained for reproducibility and diagnostic comparison, but the final manuscript reports model-level uncertainty across the independently trained GAN seeds 35, 39, and 42.
+
+Historical code or output files may use `glog` as an internal alias for SLoG:
 
 ```text
 glog == SLoG
 ```
+
+Additional external-survey and checkpoint-robustness summary files will be archived with the submission release as described below.
 
 ---
 
@@ -267,34 +317,157 @@ glog == SLoG
 
 ### `run_conditional_stylegan_experiment.py`
 
-Main implementation for:
+Main conditional seismic-resynthesis implementation.
 
-- conditional StyleGAN2 training;
-- SLoG / LoG / Canny condition construction;
-- multi-scale FiLM conditioning;
-- EMA checkpoint evaluation;
-- GEO and phi feature extraction;
-- FD/RR, KID-style polynomial MMD², PRDC, and SWD;
-- downstream synthetic-profile generation;
-- fixed-condition latent-sensitivity analysis.
+It supports:
+
+* Australian and F3 experiment profiles;
+* conditional StyleGAN2 training;
+* SLoG / LoG / Canny condition construction;
+* fault + AGC + edge conditioning;
+* multi-scale bounded residual FiLM injection;
+* EMA checkpoint saving and evaluation;
+* shared LoG-based GEO / phi evaluation;
+* FD/RR, KID-style polynomial MMD², PRDC, Wasserstein, and SWD metrics;
+* downstream synthetic-profile generation;
+* fixed-condition latent-sensitivity analysis.
+
+The survey-specific protocol is selected using:
+
+```text
+--profile australian
+--profile f3
+```
+
+### `final_rr_multiseed_analysis.py`
+
+Final Australian multi-training-seed analysis.
+
+This script:
+
+* reads the nine seed-specific Australian JSONL files through `multiseed_manifest.csv`;
+* validates the number of real-real FD reference trials;
+* computes seed-level summaries;
+* computes model-level mean and standard deviation across GAN training seeds;
+* performs paired cross-prior comparisons;
+* supports hierarchical bootstrap analysis.
+
+The three GAN training seeds used in the manuscript are:
+
+```text
+35, 39, 42
+```
+
+### `ranking_robustness.py`
+
+Checkpoint-selection and late-window ranking-robustness analysis.
+
+This script is used to:
+
+* parse checkpoint-wise development metrics;
+* identify checkpoints shared across prior × training-seed runs;
+* compare SLoG, LoG, and Canny across common late checkpoints;
+* examine alternative checkpoint-selection rules;
+* generate robustness tables and metric trajectories.
+
+The manuscript late-window comparison uses common checkpoints between approximately 10,000 and 20,500 optimization steps.
 
 ### `slog_parameter_search.py`
 
-Parameter-search and preprocessing-analysis program used to examine SLoG and alternative structural-prior settings.
+Parameter-search and preprocessing-analysis implementation used to examine SLoG and alternative structural-prior settings.
 
-### `unet_regression_baseline.py`
+It is used for sensitivity analysis and selection of the structural-prior parameters employed in the matched comparison.
 
-Deterministic condition-to-seismic U-Net implementation used for U-Net-L1, U-Net-Struct, paired reconstruction metrics, and distributional evaluation.
+### `plot_prior_support_characterization_500.py`
+
+Large-sample structural-prior characterization used for the 500-profile SLoG / LoG / Canny comparison.
+
+The script summarizes the spatial support and structural properties of the three priors and produces the prior-characterization figures and statistics reported in the manuscript and supplementary material.
 
 ### `seismic_edge_metrics.py`
 
-Structural-prior characterization for SLoG / LoG / Canny, including edge density, directional continuity, break rate, fragmentation, short-response ratio, orientation entropy, and low-coherence association.
+Structural-prior characterization utilities for SLoG / LoG / Canny.
+
+The implemented metrics include measures related to:
+
+* edge density;
+* directional continuity;
+* break rate;
+* fragmentation;
+* short-response ratio;
+* orientation entropy;
+* low-coherence association.
+
+### `unet_regression_baseline.py`
+
+Deterministic condition-to-seismic U-Net implementation.
+
+It supports:
+
+* U-Net-L1;
+* U-Net-Struct;
+* paired reconstruction metrics;
+* GEO / phi distributional evaluation;
+* EMA evaluation.
+
+These deterministic baselines are used to determine how much source-associated seismic information can be reconstructed directly from the supplied conditions without latent sampling or adversarial discrimination.
 
 ### `downstream_fault_segmentation.py`
 
-Common U-Net fault-segmentation implementation used for comparisons among real, SLoG-synthetic, LoG-synthetic, and Canny-synthetic training sources.
+Within-survey U-Net fault-segmentation implementation.
+
+It is used for matched comparisons among models trained on:
+
+* real seismic profiles;
+* SLoG-conditioned synthetic profiles;
+* LoG-conditioned synthetic profiles;
+* Canny-conditioned synthetic profiles.
+
+### `downstream_crosssurvey_unet.py`
+
+Cross-survey downstream fault-segmentation implementation for Australian-to-CRACKS transfer.
+
+It supports:
+
+* Thebe/Australian training data;
+* native-size CRACKS evaluation;
+* expert CRACKS mask decoding;
+* confidence-only evaluation;
+* 0.5 probability threshold;
+* 3-pixel tolerant fault matching.
+
+The primary CRACKS protocol treats:
+
+```text
+class 3 = confident fault
+class 1 = confident non-fault
+class 0 = ignored
+class 2 = ignored / uncertain
+```
+
+### `analyze_crosssurvey_bootstrap_sensitivity.py`
+
+Post-processing and statistical analysis for the CRACKS cross-survey experiment.
+
+It performs:
+
+* aggregation across U-Net training seeds;
+* per-section metric analysis;
+* confident-label evaluation;
+* uncertain-label sensitivity analysis;
+* paired section-level bootstrap;
+* hierarchical paired bootstrap across training runs and test sections.
+
+The manuscript uses:
+
+```text
+10,000 bootstrap replicates
+```
+
+for the reported cross-survey statistical analysis.
 
 ---
+
 
 ## 9. Environment
 
