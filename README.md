@@ -132,13 +132,17 @@ Thus the fault and AGC channels are shared across SLoG, LoG, and Canny; the dire
 
 ### F3 model-level results
 
-| Prior | SWD | GEO MMD | GEO W | phi FD | phi FD/RR | phi KID |
-|---|---:|---:|---:|---:|---:|---:|
-| **SLoG** | **0.1080 ± 0.0064** | **0.3036 ± 0.0253** | **1.0413 ± 0.0669** | **96.11 ± 5.70** | **2.5779 ± 0.1990** | **1.8279 ± 0.2245** |
-| LoG | 0.1091 ± 0.0066 | 0.6292 ± 0.0303 | 1.6144 ± 0.0960 | 323.84 ± 12.18 | 8.6844 ± 0.5036 | 20.3779 ± 1.7458 |
-| Canny | 0.1146 ± 0.0070 | 0.6668 ± 0.0193 | 2.1333 ± 0.0949 | 506.69 ± 17.00 | 13.5909 ± 0.8071 | 54.6218 ± 4.8891 |
+The table below reports the mean and sample standard deviation across the three independently trained GANs (`35`, `39`, and `42`) for each structural prior. Each trained generator was evaluated using 150 matched evaluation resamples. The resamples quantify within-model evaluation variability and are not treated as independent model replicates.
 
-The F3 images used for this synthesis comparison are label-free. These values therefore describe distributional agreement, not fault-label accuracy.
+| Prior    |                 SWD |             GEO MMD |               GEO W |            phi FD |           phi FD/RR |             phi KID |
+| -------- | ------------------: | ------------------: | ------------------: | ----------------: | ------------------: | ------------------: |
+| **SLoG** | **0.1083 ± 0.0006** | **0.3054 ± 0.1852** | **1.0653 ± 0.4331** | **95.85 ± 15.08** | **2.5710 ± 0.4045** | **1.8077 ± 0.5453** |
+| LoG      |     0.1088 ± 0.0006 |     0.7120 ± 0.1352 |     1.6130 ± 0.4855 |   438.43 ± 137.33 |    11.7568 ± 3.6821 |   46.3435 ± 35.1012 |
+| Canny    |     0.1134 ± 0.0016 |     0.6405 ± 0.0232 |     1.9650 ± 0.1471 |   607.43 ± 111.05 |    16.2937 ± 2.9796 |   92.0429 ± 44.7224 |
+
+The complete seed-level and model-level statistics are provided under `results/f3/`. The nine `*_metrics_test_summary.json` files retain the 150 evaluation runs for each independently trained generator.
+
+The F3 images used for this synthesis comparison are label-free. These values therefore describe distributional agreement rather than fault-label accuracy.
 
 ---
 
@@ -245,7 +249,6 @@ slog-seismic-profile-generation/
 │
 └── results/
     ├── multiseed_manifest.csv
-    │
     ├── slog35.jsonl
     ├── slog39.jsonl
     ├── slog42.jsonl
@@ -266,50 +269,90 @@ slog-seismic-profile-generation/
     ├── stylegan_slog_summary.json
     ├── stylegan_log_summary.json
     ├── stylegan_canny_summary.json
-    │
     ├── unet_l1_summary.json
     ├── unet_struct_summary.json
-    │
     ├── algorithm_summary.csv
     ├── seismic_edge_metrics.csv
-    └── effective_parameters.json
+    ├── effective_parameters.json
+    │
+    ├── f3/
+    │   ├── README.md
+    │   ├── f3_manifest.csv
+    │   ├── seed_level_summary.csv
+    │   ├── model_level_summary.csv
+    │   ├── slog35_metrics_test_summary.json
+    │   ├── slog39_metrics_test_summary.json
+    │   ├── slog42_metrics_test_summary.json
+    │   ├── log35_metrics_test_summary.json
+    │   ├── log39_metrics_test_summary.json
+    │   ├── log42_metrics_test_summary.json
+    │   ├── canny35_metrics_test_summary.json
+    │   ├── canny39_metrics_test_summary.json
+    │   └── canny42_metrics_test_summary.json
+    │
+    ├── cracks/
+    │   ├── README.md
+    │   ├── aggregate_metrics.csv
+    │   ├── training_seed_summary.csv
+    │   ├── paired_bootstrap_results.json
+    │   └── per_section_metrics_and_counts.csv
+    │
+    └── robustness/
+        ├── README.md
+        ├── development_metrics_clean.csv
+        ├── common_step_rankings.csv
+        ├── common_step_winner_frequency.csv
+        └── selected_steps_wide.csv
 ```
 
-The nine files
+The nine top-level `slog35/39/42`, `log35/39/42`, and `canny35/39/42` JSONL files contain the final Australian evaluation outputs for three independently trained generators per structural prior. Each file contains 150 matched evaluation runs used to construct the Australian seed-level and model-level statistics.
+
+`multiseed_manifest.csv` maps each Australian structural prior and GAN training seed to its corresponding JSONL result file and records the real-real FD reference-trial setting used in the final analysis.
+
+### External F3 results
+
+`results/f3/` contains the final external F3 synthesis evaluation.
+
+The nine `*_metrics_test_summary.json` files correspond to:
 
 ```text
-slog35.jsonl
-slog39.jsonl
-slog42.jsonl
-log35.jsonl
-log39.jsonl
-log42.jsonl
-canny35.jsonl
-canny39.jsonl
-canny42.jsonl
+3 structural priors × 3 independent GAN training seeds
 ```
 
-contain the final Australian evaluation outputs for three independently trained generators per structural prior. Each file contains 150 matched evaluation runs used to construct the final seed-level and model-level statistics reported in the manuscript.
+and retain the 150 matched evaluation runs for each trained generator.
 
-`multiseed_manifest.csv` provides the mapping between structural prior, GAN training seed, JSONL result file, and the number of real-real FD reference trials used for the final analysis.
+`seed_level_summary.csv` reports one row per prior × training-seed model, whereas `model_level_summary.csv` reports the mean and sample standard deviation across the three independently trained generators.
 
-The files
+`f3_manifest.csv` records the common 25,000-step checkpoint, 128×128 image size, shared LoG evaluator, evaluation seeds, and resampling protocol.
 
-```text
-stylegan_slog_summary.json
-stylegan_log_summary.json
-stylegan_canny_summary.json
-```
+### CRACKS downstream results
 
-and the corresponding `*_test_runs.jsonl` / `*_test_summary*.json` files contain earlier or auxiliary single-generator evaluation summaries. They are retained for reproducibility and diagnostic comparison, but the final manuscript reports model-level uncertainty across the independently trained GAN seeds 35, 39, and 42.
+`results/cracks/` contains the Australian-to-CRACKS downstream fault-segmentation evaluation.
 
-Historical code or output files may use `glog` as an internal alias for SLoG:
+The directory includes:
+
+* three-training-seed metric summaries;
+* per-section results for the 40 expert-annotated CRACKS sections;
+* confident-label and uncertain-label sensitivity analyses;
+* paired and hierarchical bootstrap outputs.
+
+### Checkpoint robustness results
+
+`results/robustness/` contains the Australian late-window checkpoint analysis.
+
+The same-step comparison uses 22 checkpoints shared by all nine prior × training-seed runs from 10,000 to 20,500 optimization steps.
+
+`common_step_rankings.csv` contains the prior rankings at each common checkpoint, and `common_step_winner_frequency.csv` summarizes the number of rank-1 checkpoints for each metric.
+
+The robustness analysis is intended to examine sensitivity to training progress and checkpoint choice. It does not replace independent cross-survey validation.
+
+Historical files may use `glog` as an internal alias for SLoG:
 
 ```text
 glog == SLoG
 ```
 
-Additional external-survey and checkpoint-robustness summary files will be archived with the submission release as described below.
+Earlier `stylegan_*_summary.json` and `*_test_runs.jsonl` / `*_test_summary*.json` files are retained as auxiliary single-generator evaluation records and should not be confused with the final three-independent-training-seed model-level statistics.
 
 ---
 
@@ -738,19 +781,49 @@ Canny: seed35 = 1.454, seed39 = 1.743, seed42 = 1.376
 
 These are the files used to form the manuscript's final Australian model-level means.
 
-### F3 seed files
+### F3 result files
 
-F3 files are distinguishable because they correspond to:
+The final F3 results are stored separately under:
+
+```text
+results/f3/
+```
+
+The nine generator-specific files are:
+
+```text
+slog35_metrics_test_summary.json
+slog39_metrics_test_summary.json
+slog42_metrics_test_summary.json
+
+log35_metrics_test_summary.json
+log39_metrics_test_summary.json
+log42_metrics_test_summary.json
+
+canny35_metrics_test_summary.json
+canny39_metrics_test_summary.json
+canny42_metrics_test_summary.json
+```
+
+They correspond to:
 
 ```text
 image size = 128 × 128
-training seed = 35, 39, or 42
+training seeds = 35, 39, 42
 common evaluated checkpoint = 25,000 steps
+evaluation seeds = 43, 44, 45, 46, 47
+30 repeats per evaluation seed
+150 evaluation runs per trained generator
+shared evaluation edge = LoG
 edge contribution removed from the fault-likelihood channel
 external F3 field-image dataset
 ```
 
-Therefore, files labeled only by `SLoG/LoG/Canny + seed35/39/42` should not automatically be assumed to be F3. The dataset, image size, checkpoint step, and preprocessing/fault-channel configuration should be checked.
+`seed_level_summary.csv` contains the evaluation mean for each independently trained generator together with its within-model evaluation variability.
+
+`model_level_summary.csv` then aggregates the three independently trained generators and reports the mean and sample standard deviation across training seeds.
+
+Therefore, evaluation resampling variability within one trained generator must not be interpreted as independent-training uncertainty.
 
 ### Legacy summary files
 
@@ -806,6 +879,7 @@ Likewise, domain-specific FD values should not be interpreted as ImageNet FID.
 - Training seeds 35, 39, and 42 represent independently trained generators.
 - Evaluation seeds 43–47 and repeated resampling are used within each trained model and should not be treated as independent model replicates.
 - Final Australian model-level uncertainty is computed across the three independently trained generators.
+- Final F3 model-level uncertainty is likewise computed across the three independently trained generators; the 150 evaluation resamples within each generator are not independent model replicates.
 - The final Australian cross-prior comparison must use the same LoG-based shared evaluator.
 - Australian checkpoint selection is performed independently for each training seed using the same criterion.
 - The late-window analysis uses 22 common checkpoints from 10,000 to 20,500 steps.
