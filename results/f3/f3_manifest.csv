@@ -1,0 +1,10 @@
+prior,training_seed,result_file,checkpoint_step,image_size,batch_size,epochs,condition_edge_type,evaluation_edge_type,tex_layout,fault_channel_protocol,evaluation_seeds,repeats_per_evaluation_seed,evaluation_runs,evaluation_condition_pool_size,evaluation_pool_seed
+SLoG,35,slog35_metrics_test_summary.json,25000,128,16,253,slog,log,"fault,agc,edge",fault_no_edge,43;44;45;46;47,30,150,256,35
+SLoG,39,slog39_metrics_test_summary.json,25000,128,16,253,slog,log,"fault,agc,edge",fault_no_edge,43;44;45;46;47,30,150,256,39
+SLoG,42,slog42_metrics_test_summary.json,25000,128,16,253,slog,log,"fault,agc,edge",fault_no_edge,43;44;45;46;47,30,150,256,42
+LoG,35,log35_metrics_test_summary.json,25000,128,16,253,log,log,"fault,agc,edge",fault_no_edge,43;44;45;46;47,30,150,256,35
+LoG,39,log39_metrics_test_summary.json,25000,128,16,253,log,log,"fault,agc,edge",fault_no_edge,43;44;45;46;47,30,150,256,39
+LoG,42,log42_metrics_test_summary.json,25000,128,16,253,log,log,"fault,agc,edge",fault_no_edge,43;44;45;46;47,30,150,256,42
+Canny,35,canny35_metrics_test_summary.json,25000,128,16,253,canny,log,"fault,agc,edge",fault_no_edge,43;44;45;46;47,30,150,256,35
+Canny,39,canny39_metrics_test_summary.json,25000,128,16,253,canny,log,"fault,agc,edge",fault_no_edge,43;44;45;46;47,30,150,256,39
+Canny,42,canny42_metrics_test_summary.json,25000,128,16,253,canny,log,"fault,agc,edge",fault_no_edge,43;44;45;46;47,30,150,256,42
